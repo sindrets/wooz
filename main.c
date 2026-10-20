@@ -345,11 +345,19 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
 
   // Apply initial zoom on first configure
   if (!win->initial_zoom_applied && win->state->config.initial_zoom > 0.0) {
-    double center_x = win->output->logical_geometry.width / 2.0;
-    double center_y = win->output->logical_geometry.height / 2.0;
+    double zoom_x;
+    double zoom_y;
+    // Zoom onto the current mouse position if known, else center
+    if (win->pointer_x >= 0.0 && win->pointer_y >= 0.0) {
+      zoom_x = win->pointer_x;
+      zoom_y = win->pointer_y;
+    } else {
+      zoom_x = win->output->logical_geometry.width / 2.0;
+      zoom_y = win->output->logical_geometry.height / 2.0;
+    }
     double zoom_pixels =
         win->output->geometry.height * win->state->config.initial_zoom;
-    apply_zoom(win, zoom_pixels, center_x, center_y);
+    apply_zoom(win, zoom_pixels, zoom_x, zoom_y);
     render_window(win);
     win->initial_zoom_applied = true;
     return; // render_window already calls wl_surface_commit
