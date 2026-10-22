@@ -22,6 +22,8 @@ protocols = [
 	wl_protocol_dir / 'stable/xdg-shell/xdg-shell.xml',
 	wl_protocol_dir / 'staging/fractional-scale/fractional-scale-v1.xml',
 	wl_protocol_dir / 'stable/viewporter/viewporter.xml',
+	wl_protocol_dir / 'staging/cursor-shape/cursor-shape-v1.xml',
+	wl_protocol_dir / 'stable/tablet/tablet-v2.xml',
 	'wlr-screencopy-unstable-v1.xml',
 	'wlr-layer-shell-unstable-v1.xml',
 ]

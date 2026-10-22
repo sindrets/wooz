@@ -12,6 +12,7 @@
 #include "output-layout.h"
 #include "wooz.h"
 
+#include "cursor-shape-v1-protocol.h"
 #include "viewporter-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "wlr-screencopy-unstable-v1-protocol.h"
@@ -370,6 +371,12 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
       window->is_focused = false;
     }
   }
+
+  if (state->cursor_shape_device != NULL) {
+    wp_cursor_shape_device_v1_set_shape(
+        state->cursor_shape_device, serial,
+        WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+  }
 }
 
 static void pointer_handle_leave(void *data, struct wl_pointer *pointer,
@@ -583,10 +590,18 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat,
   if ((capabilities & WL_SEAT_CAPABILITY_POINTER) != 0) {
     state->pointer = wl_seat_get_pointer(seat);
     wl_pointer_add_listener(state->pointer, &pointer_listener, state);
+    if (state->cursor_shape_manager != NULL) {
+      state->cursor_shape_device = wp_cursor_shape_manager_v1_get_pointer(
+          state->cursor_shape_manager, state->pointer);
+    }
   } else {
     if (state->pointer != NULL) {
       wl_pointer_destroy(state->pointer);
       state->pointer = NULL;
+    }
+    if (state->cursor_shape_device != NULL) {
+      wp_cursor_shape_device_v1_destroy(state->cursor_shape_device);
+      state->cursor_shape_device = NULL;
     }
   }
 
@@ -640,6 +655,10 @@ static void handle_global(void *data, struct wl_registry *registry,
   } else if (strcmp(interface, wl_seat_interface.name) == 0) {
     state->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
     wl_seat_add_listener(state->seat, &seat_listener, state);
+  } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) ==
+             0) {
+    state->cursor_shape_manager = wl_registry_bind(
+        registry, name, &wp_cursor_shape_manager_v1_interface, 1);
   }
 }
 
@@ -997,6 +1016,12 @@ int main(int argc, char *argv[]) {
   zwlr_screencopy_manager_v1_destroy(state.screencopy_manager);
   if (state.xdg_output_manager != NULL) {
     zxdg_output_manager_v1_destroy(state.xdg_output_manager);
+  }
+  if (state.cursor_shape_device) {
+    wp_cursor_shape_device_v1_destroy(state.cursor_shape_device);
+  }
+  if (state.cursor_shape_manager) {
+    wp_cursor_shape_manager_v1_destroy(state.cursor_shape_manager);
   }
   if (state.pointer) {
     wl_pointer_release(state.pointer);

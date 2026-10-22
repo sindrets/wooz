@@ -27,6 +27,8 @@ struct wooz_state {
   struct wp_viewporter *viewporter;
   struct wl_seat *seat;
   struct wl_pointer *pointer;
+  struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
+  struct wp_cursor_shape_device_v1 *cursor_shape_device;
   struct wl_keyboard *keyboard;
   struct wl_list outputs;
   struct wl_list windows;
