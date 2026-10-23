@@ -18,6 +18,7 @@ wooz [options...]
 * `--output NAME` - Run on specific output (e.g., 'DP-1', 'HDMI-A-1')
 * `--zoom-in PERCENT` - Set initial zoom percentage (e.g., '10%', '50%')
 * `--invert-scroll` - Invert scroll direction (scroll up zooms in)
+* `--no-aa` - Start with anti-aliasing disabled (nearest-neighbor scaling)
 
 ### Controls
 

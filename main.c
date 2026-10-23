@@ -874,6 +874,8 @@ static const char usage[] =
     "  --zoom-in PERCENT       Set initial zoom percentage (e.g., '10%', "
     "'50%')\n"
     "  --invert-scroll         Invert scroll direction (scroll up zooms in)\n"
+    "  --no-aa                 Start with anti-aliasing disabled "
+    "(nearest-neighbor)\n"
     "\n"
     "Controls:\n"
     "  Mouse scroll            Zoom in/out at mouse position\n"
@@ -916,6 +918,8 @@ static uint32_t parse_key_name(const char *name) {
 
 int main(int argc, char *argv[]) {
   struct wooz_config config = {0};
+  // Compositor scaling is bilinear: anti-aliasing is on unless disabled.
+  config.antialias = true;
 
   static struct option long_options[] = {
       {"help", no_argument, 0, 'h'},
@@ -924,6 +928,7 @@ int main(int argc, char *argv[]) {
       {"output", required_argument, 0, 'o'},
       {"zoom-in", required_argument, 0, 'z'},
       {"invert-scroll", no_argument, 0, 'i'},
+      {"no-aa", no_argument, 0, 'A'},
       {0, 0, 0, 0}};
 
   int opt;
@@ -966,6 +971,9 @@ int main(int argc, char *argv[]) {
     }
     case 'i':
       config.invert_scroll = true;
+      break;
+    case 'A':
+      config.antialias = false;
       break;
     default:
       fprintf(stderr, "%s", usage);
@@ -1088,8 +1096,8 @@ int main(int argc, char *argv[]) {
     struct wooz_window *win = calloc(1, sizeof(struct wooz_window));
     wl_list_insert(&state.windows, &win->link);
     win->state = &state;
-    // Compositor scaling is bilinear: start with anti-aliasing enabled.
-    win->antialias = true;
+    // On by default; --no-aa starts with nearest-neighbor sampling instead.
+    win->antialias = state.config.antialias;
     win->output = output;
     win->surface = wl_compositor_create_surface(state.compositor);
     win->viewport = wp_viewporter_get_viewport(state.viewporter, win->surface);
