@@ -2,6 +2,8 @@
 #include <linux/input-event-codes.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +60,15 @@
 // source column are long enough that filling them beats an indexed load per
 // pixel; below that the runs are too short and the loop overhead wins.
 #define RUN_FILL_MIN_STEP 0.25
+
+// Resampling is a store-bandwidth-bound kernel, so large buffers are spread
+// over the cores: each one drives its share of the memory traffic.
+#define SAMPLER_MAX_THREADS 8
+// Buffers smaller than this are not worth waking the workers up for.
+#define SAMPLER_MIN_PIXELS 1000000
+// Rows are handed out in chunks (their cost varies: duplicated rows are plain
+// memcpys), this many per thread.
+#define SAMPLER_CHUNKS_PER_THREAD 4
 
 static double now_ms(void) {
   struct timespec ts;
@@ -182,6 +193,221 @@ static bool build_runs(struct wooz_window *win, int32_t dest_width, double step,
   return true;
 }
 
+// One resampling job, shared read-only by the pool workers while it runs.
+struct wooz_sampler_job {
+  const uint32_t *src;
+  uint32_t *dst;
+  size_t src_stride, dst_stride;
+  int32_t width, height;
+  int32_t x0, y0, src_height;
+  double step_x, step_y, phase_x, phase_y;
+  const int32_t *columns;
+  const struct wooz_run *runs;
+  int32_t run_count;
+  bool use_runs, copy_rows;
+  int32_t chunk_rows, n_chunks;
+};
+
+// Persistent worker pool spreading the resampling over the cores.
+struct wooz_pool {
+  pthread_t threads[SAMPLER_MAX_THREADS];
+  int n_threads;
+  pthread_mutex_t mutex;
+  pthread_cond_t wake;
+  pthread_cond_t finished;
+  struct wooz_sampler_job *job;
+  unsigned generation;
+  int busy;
+  bool stop;
+  atomic_int next_chunk;
+};
+
+// Rasterizes rows [y_begin, y_end) of the job.
+static void sample_rows(const struct wooz_sampler_job *job, int32_t y_begin,
+                        int32_t y_end) {
+  const uint32_t *prev_src_row = NULL;
+  uint32_t *prev_dst_row = NULL;
+
+  for (int32_t y = y_begin; y < y_end; ++y) {
+    int32_t sy = min((int32_t)floor(job->phase_y + y * job->step_y),
+                     job->src_height - 1);
+    const uint32_t *src_row =
+        job->src + (size_t)(job->y0 + sy) * job->src_stride + (size_t)job->x0;
+    uint32_t *dst_row = job->dst + (size_t)y * job->dst_stride;
+
+    if (src_row == prev_src_row) {
+      // Magnification repeats source rows: duplicate the previous output row.
+      memcpy(dst_row, prev_dst_row, (size_t)job->width * sizeof(uint32_t));
+      continue;
+    }
+
+    prev_src_row = src_row;
+    prev_dst_row = dst_row;
+
+    if (job->copy_rows) {
+      memcpy(dst_row, src_row, (size_t)job->width * sizeof(uint32_t));
+      continue;
+    }
+
+    if (job->use_runs) {
+      for (int32_t r = 0; r < job->run_count; ++r) {
+        int32_t start = job->runs[r].x;
+        int32_t end = r + 1 < job->run_count ? job->runs[r + 1].x : job->width;
+        uint32_t value = src_row[job->runs[r].column];
+
+        for (int32_t x = start; x < end; ++x) {
+          dst_row[x] = value;
+        }
+      }
+    } else {
+      for (int32_t x = 0; x < job->width; ++x) {
+        dst_row[x] = src_row[job->columns[x]];
+      }
+    }
+  }
+}
+
+static void sample_chunk(const struct wooz_sampler_job *job, int32_t chunk) {
+  int32_t y_begin = chunk * job->chunk_rows;
+
+  sample_rows(job, y_begin, min(y_begin + job->chunk_rows, job->height));
+}
+
+static void *sampler_worker(void *data) {
+  struct wooz_pool *pool = data;
+  unsigned seen = 0;
+
+  for (;;) {
+    pthread_mutex_lock(&pool->mutex);
+    while (pool->generation == seen && !pool->stop) {
+      pthread_cond_wait(&pool->wake, &pool->mutex);
+    }
+    if (pool->stop) {
+      pthread_mutex_unlock(&pool->mutex);
+      break;
+    }
+
+    seen = pool->generation;
+    const struct wooz_sampler_job *job = pool->job;
+    pthread_mutex_unlock(&pool->mutex);
+
+    for (;;) {
+      int32_t chunk = atomic_fetch_add(&pool->next_chunk, 1);
+      if (chunk >= job->n_chunks) {
+        break;
+      }
+
+      sample_chunk(job, chunk);
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+    if (--pool->busy == 0) {
+      pthread_cond_signal(&pool->finished);
+    }
+    pthread_mutex_unlock(&pool->mutex);
+  }
+
+  return NULL;
+}
+
+// Resamples the job, on the pool for large buffers and inline otherwise.
+static void sampler_run(struct wooz_pool *pool,
+                        const struct wooz_sampler_job *job) {
+  if (pool == NULL || pool->n_threads == 0 ||
+      (int64_t)job->width * job->height < SAMPLER_MIN_PIXELS) {
+    sample_rows(job, 0, job->height);
+    return;
+  }
+
+  pool->job = (struct wooz_sampler_job *)job;
+  atomic_store(&pool->next_chunk, 0);
+
+  pthread_mutex_lock(&pool->mutex);
+  ++pool->generation;
+  pool->busy = pool->n_threads;
+  pthread_cond_broadcast(&pool->wake);
+  pthread_mutex_unlock(&pool->mutex);
+
+  // The caller takes chunks too, so no core is left idle.
+  for (;;) {
+    int32_t chunk = atomic_fetch_add(&pool->next_chunk, 1);
+    if (chunk >= job->n_chunks) {
+      break;
+    }
+
+    sample_chunk(job, chunk);
+  }
+
+  pthread_mutex_lock(&pool->mutex);
+  while (pool->busy > 0) {
+    pthread_cond_wait(&pool->finished, &pool->mutex);
+  }
+  pthread_mutex_unlock(&pool->mutex);
+}
+
+static struct wooz_pool *sampler_pool_create(void) {
+  long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  int n = cpus > 0 ? min((int)cpus - 1, SAMPLER_MAX_THREADS) : 0;
+  if (n < 1) {
+    return NULL;
+  }
+
+  struct wooz_pool *pool = calloc(1, sizeof(struct wooz_pool));
+  if (pool == NULL) {
+    return NULL;
+  }
+
+  atomic_init(&pool->next_chunk, 0);
+
+  if (pthread_mutex_init(&pool->mutex, NULL) != 0) {
+    free(pool);
+    return NULL;
+  }
+  if (pthread_cond_init(&pool->wake, NULL) != 0 ||
+      pthread_cond_init(&pool->finished, NULL) != 0) {
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+    return NULL;
+  }
+
+  for (int i = 0; i < n; ++i) {
+    if (pthread_create(&pool->threads[i], NULL, sampler_worker, pool) != 0) {
+      break;
+    }
+    ++pool->n_threads;
+  }
+
+  if (pool->n_threads == 0) {
+    pthread_cond_destroy(&pool->finished);
+    pthread_cond_destroy(&pool->wake);
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+    return NULL;
+  }
+
+  return pool;
+}
+
+static void sampler_pool_destroy(struct wooz_pool *pool) {
+  if (pool == NULL) {
+    return;
+  }
+
+  pthread_mutex_lock(&pool->mutex);
+  pool->stop = true;
+  pthread_cond_broadcast(&pool->wake);
+  pthread_mutex_unlock(&pool->mutex);
+
+  for (int i = 0; i < pool->n_threads; ++i) {
+    pthread_join(pool->threads[i], NULL);
+  }
+
+  pthread_cond_destroy(&pool->finished);
+  pthread_cond_destroy(&pool->wake);
+  pthread_mutex_destroy(&pool->mutex);
+  free(pool);
+}
+
 // Magnify the view source rectangle to the whole buffer using nearest-neighbor
 // sampling, bypassing the bilinear filtering the compositor applies when
 // scaling. Returns the buffer to attach, or NULL when client-side sampling
@@ -288,49 +514,37 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
     }
   }
 
-  const uint32_t *src_data = src->data;
-  uint32_t *dst_data = dst->data;
-  size_t src_stride = (size_t)src->stride / sizeof(uint32_t);
-  size_t dst_stride = (size_t)dst->stride / sizeof(uint32_t);
-  const uint32_t *prev_src_row = NULL;
-  uint32_t *prev_dst_row = NULL;
+  // Hand the rasterization to the pool; rows are split into chunks because
+  // their cost varies (duplicated rows are plain memcpys).
+  int32_t n_threads = win->state->sampler_pool != NULL
+                          ? win->state->sampler_pool->n_threads + 1
+                          : 1;
+  int32_t chunk_rows = max(height / (n_threads * SAMPLER_CHUNKS_PER_THREAD), 1);
 
-  for (int32_t y = 0; y < height; ++y) {
-    int32_t sy = min((int32_t)floor(phase_y + y * step_y), src_height - 1);
-    const uint32_t *src_row =
-        src_data + (size_t)(y0 + sy) * src_stride + (size_t)x0;
-    uint32_t *dst_row = dst_data + (size_t)y * dst_stride;
+  struct wooz_sampler_job job = {
+      .src = src->data,
+      .dst = dst->data,
+      .src_stride = (size_t)src->stride / sizeof(uint32_t),
+      .dst_stride = (size_t)dst->stride / sizeof(uint32_t),
+      .width = width,
+      .height = height,
+      .x0 = x0,
+      .y0 = y0,
+      .src_height = src_height,
+      .step_x = step_x,
+      .step_y = step_y,
+      .phase_x = phase_x,
+      .phase_y = phase_y,
+      .columns = columns,
+      .runs = runs,
+      .run_count = run_count,
+      .use_runs = use_runs,
+      .copy_rows = step_x == 1.0 && phase_x == 0.0,
+      .chunk_rows = chunk_rows,
+      .n_chunks = (height + chunk_rows - 1) / chunk_rows,
+  };
 
-    if (src_row == prev_src_row) {
-      // Magnification repeats source rows: duplicate the previous output row.
-      memcpy(dst_row, prev_dst_row, (size_t)width * sizeof(uint32_t));
-      continue;
-    }
-
-    prev_src_row = src_row;
-    prev_dst_row = dst_row;
-
-    if (step_x == 1.0 && phase_x == 0.0) {
-      memcpy(dst_row, src_row, (size_t)width * sizeof(uint32_t));
-      continue;
-    }
-
-    if (use_runs) {
-      for (int32_t r = 0; r < run_count; ++r) {
-        int32_t start = runs[r].x;
-        int32_t end = r + 1 < run_count ? runs[r + 1].x : width;
-        uint32_t value = src_row[runs[r].column];
-
-        for (int32_t x = start; x < end; ++x) {
-          dst_row[x] = value;
-        }
-      }
-    } else {
-      for (int32_t x = 0; x < width; ++x) {
-        dst_row[x] = src_row[columns[x]];
-      }
-    }
-  }
+  sampler_run(win->state->sampler_pool, &job);
 
   win->sampled_valid = true;
   win->sampled_x = x0;
@@ -1405,6 +1619,7 @@ int main(int argc, char *argv[]) {
   struct wooz_state state = {0};
   state.config = config;
   state.repeat_timer_fd = -1;
+  state.sampler_pool = sampler_pool_create();
   wl_list_init(&state.outputs);
   wl_list_init(&state.windows);
 
@@ -1677,6 +1892,7 @@ int main(int argc, char *argv[]) {
   wl_shm_destroy(state.shm);
   wl_registry_destroy(state.registry);
   wl_compositor_destroy(state.compositor);
+  sampler_pool_destroy(state.sampler_pool);
   wl_display_disconnect(state.display);
 
   // Free config resources

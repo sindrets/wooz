@@ -18,6 +18,7 @@ add_project_arguments(cc.get_supported_arguments([
 math = cc.find_library('m')
 realtime = cc.find_library('rt')
 wayland_client = dependency('wayland-client')
+threads = dependency('threads')
 
 is_le = host_machine.endian() == 'little'
 add_project_arguments([
@@ -37,6 +38,7 @@ wooz_deps = [
 	math,
 	realtime,
 	wayland_client,
+	threads,
 ]
 
 executable(

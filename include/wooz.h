@@ -49,6 +49,8 @@ struct wooz_state {
 
   struct wooz_window *focused;
   struct wooz_config config;
+  struct wooz_pool
+      *sampler_pool; // Worker pool for the nearest-neighbor sampler
 
   // Key repeat state
   uint32_t pressed_key;
@@ -58,6 +60,7 @@ struct wooz_state {
 };
 
 struct wooz_buffer;
+struct wooz_pool;
 
 struct wooz_output {
   struct wooz_state *state;
