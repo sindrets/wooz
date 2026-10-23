@@ -13,6 +13,8 @@
 #include "wooz.h"
 
 #include "cursor-shape-v1-protocol.h"
+#include "ext-image-capture-source-v1-protocol.h"
+#include "ext-image-copy-capture-v1-protocol.h"
 #include "viewporter-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "wlr-screencopy-unstable-v1-protocol.h"
@@ -493,6 +495,46 @@ static const struct wl_output_listener output_listener = {
     .scale = output_handle_scale,
 };
 
+// Applies the configured initial zoom, centered on the pointer when its
+// position is known and on the screen center otherwise.
+//
+// The wl_pointer position is preferred when the compositor reports it before
+// the first configure. Compositors that only report it once the pointer moves
+// are covered by the ext-image-copy-capture cursor probe, and the screen center
+// is the last resort.
+//
+// Returns true when the zoom was applied, in which case the window has been
+// rendered.
+static bool apply_initial_zoom(struct wooz_window *win) {
+  if (win->initial_zoom_applied || !win->configured ||
+      win->state->config.initial_zoom <= 0.0) {
+    return false;
+  }
+
+  struct wooz_output *output = win->output;
+  double zoom_x = output->logical_geometry.width / 2.0;
+  double zoom_y = output->logical_geometry.height / 2.0;
+
+  if (win->pointer_x >= 0.0 && win->pointer_y >= 0.0) {
+    zoom_x = win->pointer_x;
+    zoom_y = win->pointer_y;
+  } else if (output->cursor_known &&
+             output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
+    // The cursor probe reports the hotspot in the output's buffer pixels.
+    double scale = output->logical_scale > 0.0 ? output->logical_scale : 1.0;
+    zoom_x = output->cursor_x / scale;
+    zoom_y = output->cursor_y / scale;
+  }
+
+  double zoom_pixels =
+      output->geometry.height * win->state->config.initial_zoom;
+  apply_zoom(win, zoom_pixels, zoom_x, zoom_y);
+  win->initial_zoom_applied = true;
+  render_window(win);
+
+  return true;
+}
+
 static void layer_surface_handle_configure(
     void *data, struct zwlr_layer_surface_v1 *layer_surface, uint32_t serial,
     uint32_t width, uint32_t height) {
@@ -504,27 +546,13 @@ static void layer_surface_handle_configure(
     wp_viewport_set_destination(win->viewport, width, height);
   }
 
-  // Apply initial zoom on first configure
-  if (!win->initial_zoom_applied && win->state->config.initial_zoom > 0.0) {
-    double zoom_x;
-    double zoom_y;
-    // Zoom onto the current mouse position if known, else center
-    if (win->pointer_x >= 0.0 && win->pointer_y >= 0.0) {
-      zoom_x = win->pointer_x;
-      zoom_y = win->pointer_y;
-    } else {
-      zoom_x = win->output->logical_geometry.width / 2.0;
-      zoom_y = win->output->logical_geometry.height / 2.0;
-    }
-    double zoom_pixels =
-        win->output->geometry.height * win->state->config.initial_zoom;
-    apply_zoom(win, zoom_pixels, zoom_x, zoom_y);
-    win->initial_zoom_applied = true;
-  }
+  win->configured = true;
 
-  // Attaches the appropriate buffer (compositor-scaled or client-side sampled)
-  // and commits the surface.
-  render_window(win);
+  // Zoom onto the pointer if its position is known, and onto the screen center
+  // otherwise.
+  if (!apply_initial_zoom(win)) {
+    render_window(win);
+  }
 }
 
 static void
@@ -580,6 +608,10 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer,
                                   uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
+
+  if (win == NULL) {
+    return;
+  }
 
   double x = wl_fixed_to_double(sx);
   double y = wl_fixed_to_double(sy);
@@ -697,7 +729,6 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
   if (win == NULL) {
     return;
   }
-
   if (key_state == WL_KEYBOARD_KEY_STATE_RELEASED) {
     // Stop key repeat when any key is released
     if (state->pressed_key == key) {
@@ -849,6 +880,17 @@ static void handle_global(void *data, struct wl_registry *registry,
              0) {
     state->cursor_shape_manager = wl_registry_bind(
         registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+  } else if (strcmp(interface,
+                    ext_image_copy_capture_manager_v1_interface.name) == 0) {
+    state->image_copy_capture_manager = wl_registry_bind(
+        registry, name, &ext_image_copy_capture_manager_v1_interface, 1);
+  } else if (strcmp(
+                 interface,
+                 ext_output_image_capture_source_manager_v1_interface.name) ==
+             0) {
+    state->output_image_capture_source_manager = wl_registry_bind(
+        registry, name, &ext_output_image_capture_source_manager_v1_interface,
+        1);
   }
 }
 
@@ -903,6 +945,96 @@ static bool should_include_output(struct wooz_output *output,
 
   // Check if the output name matches the filter
   return strcmp(output->name, filter) == 0;
+}
+
+static void cursor_session_handle_enter(
+    void *data, struct ext_image_copy_capture_cursor_session_v1 *session) {
+  // A position event follows, nothing to do here.
+}
+
+static void cursor_session_handle_leave(
+    void *data, struct ext_image_copy_capture_cursor_session_v1 *session) {
+  struct wooz_output *output = data;
+
+  output->cursor_known = false;
+}
+
+static void cursor_session_handle_position(
+    void *data, struct ext_image_copy_capture_cursor_session_v1 *session,
+    int32_t x, int32_t y) {
+  struct wooz_output *output = data;
+
+  output->cursor_x = x;
+  output->cursor_y = y;
+  output->cursor_known = true;
+}
+
+static void cursor_session_handle_hotspot(
+    void *data, struct ext_image_copy_capture_cursor_session_v1 *session,
+    int32_t x, int32_t y) {
+  // The hotspot of the cursor image is irrelevant for placing the view.
+}
+
+static const struct ext_image_copy_capture_cursor_session_v1_listener
+    cursor_session_listener = {
+        .enter = cursor_session_handle_enter,
+        .leave = cursor_session_handle_leave,
+        .position = cursor_session_handle_position,
+        .hotspot = cursor_session_handle_hotspot,
+};
+
+// Sets up a cursor probe per output, so that the initial zoom can be centered
+// on the pointer without wl_pointer (which only reports its position to the
+// focused surface, and some compositors only do so once the pointer moves).
+// Best effort: compositors without ext-image-copy-capture keep using the
+// wl_pointer position and, failing that, the screen center.
+static void setup_cursor_probes(struct wooz_state *state) {
+  if (state->image_copy_capture_manager == NULL ||
+      state->output_image_capture_source_manager == NULL ||
+      state->pointer == NULL) {
+    return;
+  }
+
+  struct wooz_output *output;
+  wl_list_for_each(output, &state->outputs, link) {
+    if (!should_include_output(output, state->config.output_filter)) {
+      continue;
+    }
+
+    output->cursor_source =
+        ext_output_image_capture_source_manager_v1_create_source(
+            state->output_image_capture_source_manager, output->wl_output);
+    if (output->cursor_source == NULL) {
+      continue;
+    }
+
+    output->cursor_session =
+        ext_image_copy_capture_manager_v1_create_pointer_cursor_session(
+            state->image_copy_capture_manager, output->cursor_source,
+            state->pointer);
+    if (output->cursor_session == NULL) {
+      continue;
+    }
+
+    ext_image_copy_capture_cursor_session_v1_add_listener(
+        output->cursor_session, &cursor_session_listener, output);
+  }
+
+  // Receive the initial cursor positions before the windows are created.
+  wl_display_roundtrip(state->display);
+
+  // Only the startup position is needed, so drop the probes again: capture
+  // sessions shouldn't stay open for the lifetime of the magnifier.
+  wl_list_for_each(output, &state->outputs, link) {
+    if (output->cursor_session != NULL) {
+      ext_image_copy_capture_cursor_session_v1_destroy(output->cursor_session);
+      output->cursor_session = NULL;
+    }
+    if (output->cursor_source != NULL) {
+      ext_image_capture_source_v1_destroy(output->cursor_source);
+      output->cursor_source = NULL;
+    }
+  }
 }
 
 static uint32_t parse_key_name(const char *name) {
@@ -1052,6 +1184,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  setup_cursor_probes(&state);
+
   size_t n_pending = 0;
   struct wooz_output *output;
   wl_list_for_each(output, &state.outputs, link) {
@@ -1099,6 +1233,9 @@ int main(int argc, char *argv[]) {
     // On by default; --no-aa starts with nearest-neighbor sampling instead.
     win->antialias = state.config.antialias;
     win->output = output;
+    // The pointer position is unknown until the compositor reports it.
+    win->pointer_x = -1.0;
+    win->pointer_y = -1.0;
     win->surface = wl_compositor_create_surface(state.compositor);
     win->viewport = wp_viewporter_get_viewport(state.viewporter, win->surface);
     win->view_source = (struct wooz_boxf){
@@ -1220,6 +1357,13 @@ int main(int argc, char *argv[]) {
     free(output);
   }
   zwlr_screencopy_manager_v1_destroy(state.screencopy_manager);
+  if (state.image_copy_capture_manager != NULL) {
+    ext_image_copy_capture_manager_v1_destroy(state.image_copy_capture_manager);
+  }
+  if (state.output_image_capture_source_manager != NULL) {
+    ext_output_image_capture_source_manager_v1_destroy(
+        state.output_image_capture_source_manager);
+  }
   if (state.xdg_output_manager != NULL) {
     zxdg_output_manager_v1_destroy(state.xdg_output_manager);
   }
