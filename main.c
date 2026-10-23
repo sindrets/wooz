@@ -495,8 +495,9 @@ static const struct wl_output_listener output_listener = {
     .scale = output_handle_scale,
 };
 
-// Applies the configured initial zoom, centered on the pointer when its
-// position is known and on the screen center otherwise.
+// Applies the configured initial zoom, centered on the position given with
+// --zoom-at, on the pointer when its position is known, or on the screen
+// center.
 //
 // The wl_pointer position is preferred when the compositor reports it before
 // the first configure. Compositors that only report it once the pointer moves
@@ -511,11 +512,15 @@ static bool apply_initial_zoom(struct wooz_window *win) {
     return false;
   }
 
+  const struct wooz_config *config = &win->state->config;
   struct wooz_output *output = win->output;
-  double zoom_x = output->logical_geometry.width / 2.0;
-  double zoom_y = output->logical_geometry.height / 2.0;
+  double zoom_x;
+  double zoom_y;
 
-  if (win->pointer_x >= 0.0 && win->pointer_y >= 0.0) {
+  if (config->zoom_at) {
+    zoom_x = config->zoom_at_x;
+    zoom_y = config->zoom_at_y;
+  } else if (win->pointer_x >= 0.0 && win->pointer_y >= 0.0) {
     zoom_x = win->pointer_x;
     zoom_y = win->pointer_y;
   } else if (output->cursor_known &&
@@ -524,10 +529,12 @@ static bool apply_initial_zoom(struct wooz_window *win) {
     double scale = output->logical_scale > 0.0 ? output->logical_scale : 1.0;
     zoom_x = output->cursor_x / scale;
     zoom_y = output->cursor_y / scale;
+  } else {
+    zoom_x = output->logical_geometry.width / 2.0;
+    zoom_y = output->logical_geometry.height / 2.0;
   }
 
-  double zoom_pixels =
-      output->geometry.height * win->state->config.initial_zoom;
+  double zoom_pixels = output->geometry.height * config->initial_zoom;
   apply_zoom(win, zoom_pixels, zoom_x, zoom_y);
   win->initial_zoom_applied = true;
   render_window(win);
@@ -915,9 +922,12 @@ static const char usage[] =
     "  --output NAME           Run on specific output (e.g., 'DP-1')\n"
     "  --zoom-in PERCENT       Set initial zoom percentage (e.g., '10%', "
     "'50%')\n"
+    "  --zoom-at X,Y           Zoom at a position instead of the cursor "
+    "(output\n"
     "  --invert-scroll         Invert scroll direction (scroll up zooms in)\n"
     "  --no-aa                 Start with anti-aliasing disabled "
     "(nearest-neighbor)\n"
+    "                          logical coordinates)\n"
     "\n"
     "Controls:\n"
     "  Mouse scroll            Zoom in/out at mouse position\n"
@@ -989,7 +999,7 @@ static const struct ext_image_copy_capture_cursor_session_v1_listener
 // Best effort: compositors without ext-image-copy-capture keep using the
 // wl_pointer position and, failing that, the screen center.
 static void setup_cursor_probes(struct wooz_state *state) {
-  if (state->image_copy_capture_manager == NULL ||
+  if (state->config.zoom_at || state->image_copy_capture_manager == NULL ||
       state->output_image_capture_source_manager == NULL ||
       state->pointer == NULL) {
     return;
@@ -1061,6 +1071,7 @@ int main(int argc, char *argv[]) {
       {"zoom-in", required_argument, 0, 'z'},
       {"invert-scroll", no_argument, 0, 'i'},
       {"no-aa", no_argument, 0, 'A'},
+      {"zoom-at", required_argument, 0, 'Z'},
       {0, 0, 0, 0}};
 
   int opt;
@@ -1107,6 +1118,22 @@ int main(int argc, char *argv[]) {
     case 'A':
       config.antialias = false;
       break;
+    case 'Z': {
+      double x;
+      double y;
+      int consumed = 0;
+
+      if (sscanf(optarg, " %lf , %lf %n", &x, &y, &consumed) != 2 ||
+          optarg[consumed] != '\0') {
+        fprintf(stderr, "Invalid position: %s (expected 'x,y')\n", optarg);
+        return EXIT_FAILURE;
+      }
+
+      config.zoom_at = true;
+      config.zoom_at_x = x;
+      config.zoom_at_y = y;
+      break;
+    }
     default:
       fprintf(stderr, "%s", usage);
       return EXIT_FAILURE;

@@ -17,6 +17,8 @@ wooz [options...]
 * `--mouse-track` - Enable mouse tracking (follow mouse without clicking)
 * `--output NAME` - Run on specific output (e.g., 'DP-1', 'HDMI-A-1')
 * `--zoom-in PERCENT` - Set initial zoom percentage (e.g., '10%', '50%')
+* `--zoom-at X,Y` - Center the initial zoom on the given position instead of the
+  cursor (output logical coordinates, i.e. relative to each output's top-left)
 * `--invert-scroll` - Invert scroll direction (scroll up zooms in)
 * `--no-aa` - Start with anti-aliasing disabled (nearest-neighbor scaling)
 
