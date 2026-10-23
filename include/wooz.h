@@ -14,12 +14,13 @@
 #define WOOZ_SCALED_BUFFER_COUNT 2
 
 struct wooz_config {
-  uint32_t close_key; // Linux input event code for close action (0 = default Esc)
-  bool mouse_track;   // Enable mouse tracking
+  uint32_t
+      close_key;    // Linux input event code for close action (0 = default Esc)
+  bool mouse_track; // Enable mouse tracking
   double initial_zoom; // Initial zoom percentage (0.0 = no zoom, 0.1 = 10%)
   char *output_filter; // Filter to specific output name (NULL = all outputs)
-  bool invert_scroll; // Invert scroll direction (scroll up zooms in)
-  bool antialias;     // Enable anti-aliasing of the magnified region
+  bool invert_scroll;  // Invert scroll direction (scroll up zooms in)
+  bool antialias;      // Enable anti-aliasing of the magnified region
   // Initial zoom position in output logical coordinates, instead of the cursor.
   bool zoom_at;
   double zoom_at_x, zoom_at_y;
@@ -86,6 +87,17 @@ struct wooz_output {
   int32_t cursor_x, cursor_y; // hotspot, in output buffer (physical) pixels
 };
 
+// Animated zoom state: the view glides from `from` to `target` over
+// `duration_ms`, following an easing curve.
+struct wooz_zoom {
+  struct wooz_boxf from;
+  struct wooz_boxf target;
+  double start_ms;
+  double duration_ms;
+  bool active;
+  struct wl_callback *frame_callback; // Paces the animation with repaints
+};
+
 struct wooz_window {
   struct wooz_state *state;
   struct wooz_output *output;
@@ -97,6 +109,7 @@ struct wooz_window {
 
   // Viewport source rectangle.
   struct wooz_boxf view_source;
+  struct wooz_zoom zoom;
   struct wooz_boxf initial_view_source; // For restore/unzoom
 
   // Mouse pointer position if window is focused.

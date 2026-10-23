@@ -1,5 +1,6 @@
 #include <getopt.h>
 #include <linux/input-event-codes.h>
+#include <math.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,29 +47,64 @@
 #define KEY_REPEAT_DELAY_MS 500
 #define KEY_REPEAT_RATE_MS 50
 
-static void restore_view(struct wooz_window *win) {
-  win->view_source = win->initial_view_source;
+// Animated zoom: a zoom step glides to its target over a duration that grows
+// with the distance to travel, so a single notch stays snappy while a big jump
+// (e.g. zooming back out) gets more time.
+#define ZOOM_ANIMATION_MS 120.0
+#define ZOOM_ANIMATION_DISTANCE_GAIN 2.0
+#define ZOOM_ANIMATION_MAX_MS 320.0
+
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
 
-static void apply_zoom(struct wooz_window *win, double zoom_change,
-                       double center_x, double center_y) {
+// Ease-out curve: maximum velocity at the start, settling at the end. Steps
+// that arrive mid-animation stay responsive, because every leg of the animation
+// starts out fast instead of easing in.
+static double ease_out_cubic(double t) {
+  double f = 1.0 - t;
+
+  return 1.0 - f * f * f;
+}
+
+static bool same_view(const struct wooz_boxf *a, const struct wooz_boxf *b) {
+  return a->x == b->x && a->y == b->y && a->width == b->width &&
+         a->height == b->height;
+}
+
+// Keeps a view inside the captured buffer.
+static void clamp_view(struct wooz_window *win, struct wooz_boxf *view) {
+  int32_t width = win->output->buffer->width;
+  int32_t height = win->output->buffer->height;
+
+  view->width = max(min(view->width, width), MAX_SCROLL * win->output->ratio);
+  view->height = max(min(view->height, height), MAX_SCROLL);
+  view->x = max(min(view->x, width - view->width), 0);
+  view->y = max(min(view->y, height - view->height), 0);
+}
+
+// Applies a zoom step to `view`, centered on the given logical position.
+static void view_zoom(struct wooz_window *win, struct wooz_boxf *view,
+                      double zoom_change, double center_x, double center_y) {
   double ratio = win->output->ratio;
 
   // Calculate the zoom change in pixels
   double scroll = zoom_change;
 
-  if (win->view_source.width - scroll * ratio < MAX_SCROLL ||
-      win->view_source.height - scroll < MAX_SCROLL)
+  if (view->width - scroll * ratio < MAX_SCROLL ||
+      view->height - scroll < MAX_SCROLL)
     return;
 
   // Calculate center point as ratio of viewport
   double dx = center_x / (double)win->output->logical_geometry.width;
   double dy = center_y / (double)win->output->logical_geometry.height;
 
-  win->view_source.x += round(scroll * ratio * dx);
-  win->view_source.width -= round(scroll * ratio);
-  win->view_source.y += round(scroll * dy);
-  win->view_source.height -= round(scroll);
+  view->x += round(scroll * ratio * dx);
+  view->width -= round(scroll * ratio);
+  view->y += round(scroll * dy);
+  view->height -= round(scroll);
 }
 
 static bool is_32bit_shm_format(enum wl_shm_format format) {
@@ -224,17 +260,7 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
 }
 
 static void render_window(struct wooz_window *win) {
-  win->view_source.width =
-      max(min(win->view_source.width, win->output->buffer->width),
-          MAX_SCROLL * win->output->ratio);
-  win->view_source.height = max(
-      min(win->view_source.height, win->output->buffer->height), MAX_SCROLL);
-  win->view_source.x = max(min(win->view_source.x, win->output->buffer->width -
-                                                       win->view_source.width),
-                           0);
-  win->view_source.y = max(min(win->view_source.y, win->output->buffer->height -
-                                                       win->view_source.height),
-                           0);
+  clamp_view(win, &win->view_source);
 
   struct wooz_buffer *buffer = NULL;
   bool changed = true;
@@ -275,6 +301,154 @@ static void render_window(struct wooz_window *win) {
   wl_surface_commit(win->surface);
 }
 
+static void zoom_animation_step(struct wooz_window *win);
+
+static void zoom_frame_done(void *data, struct wl_callback *callback,
+                            uint32_t callback_data) {
+  struct wooz_window *win = data;
+
+  wl_callback_destroy(callback);
+  win->zoom.frame_callback = NULL;
+  zoom_animation_step(win);
+}
+
+static const struct wl_callback_listener zoom_frame_listener = {
+    .done = zoom_frame_done,
+};
+
+// Requests a frame callback, so that animation steps are paced by the
+// compositor's repaints instead of a timer.
+static void zoom_request_frame(struct wooz_window *win) {
+  if (win->zoom.frame_callback != NULL) {
+    return;
+  }
+
+  win->zoom.frame_callback = wl_surface_frame(win->surface);
+  wl_callback_add_listener(win->zoom.frame_callback, &zoom_frame_listener, win);
+}
+
+// The view that zoom input applies to: while a zoom is in flight that is the
+// animation target, so that rapid steps accumulate instead of fighting each
+// other.
+static struct wooz_boxf *zoom_reference(struct wooz_window *win) {
+  return win->zoom.active ? &win->zoom.target : &win->view_source;
+}
+
+// (Re)starts the animation towards win->zoom.target from the view that is
+// currently displayed: a step arriving mid-animation retargets the curve from
+// where the view is now, which keeps rapid scrolling continuous and lets the
+// displayed speed follow the input speed.
+//
+// Returns true when an animation was started, in which case the window has been
+// rendered.
+static bool zoom_start(struct wooz_window *win) {
+  struct wooz_zoom *zoom = &win->zoom;
+
+  if (same_view(&win->view_source, &zoom->target)) {
+    zoom->active = false;
+    return false;
+  }
+
+  zoom->from = win->view_source;
+
+  // Perceptual distance: the log of the zoom ratio. It is 0 for a view change
+  // without a zoom (e.g. restoring the view at 100%) and grows with the factor.
+  double distance = fabs(log2(zoom->target.width / zoom->from.width));
+  zoom->duration_ms =
+      ZOOM_ANIMATION_MS * (1.0 + ZOOM_ANIMATION_DISTANCE_GAIN * distance);
+  if (zoom->duration_ms > ZOOM_ANIMATION_MAX_MS) {
+    zoom->duration_ms = ZOOM_ANIMATION_MAX_MS;
+  }
+  zoom->start_ms = now_ms();
+  zoom->active = true;
+
+  if (zoom->frame_callback == NULL) {
+    zoom_request_frame(win);
+    // Commit so that the compositor delivers the callback on its next repaint;
+    // the first animation step then runs from that callback.
+    win->sampled_valid = false;
+    render_window(win);
+  }
+
+  return true;
+}
+
+// Applies a zoom step, animating towards the result. Consecutive steps add up
+// on the animation target, so scrolling rapidly accelerates the zoom instead of
+// restarting it.
+static void zoom_by(struct wooz_window *win, double zoom_change,
+                    double center_x, double center_y) {
+  struct wooz_zoom *zoom = &win->zoom;
+
+  if (!zoom->active) {
+    zoom->target = win->view_source;
+  }
+
+  struct wooz_boxf previous = zoom->target;
+  view_zoom(win, &zoom->target, zoom_change, center_x, center_y);
+  clamp_view(win, &zoom->target);
+
+  if (same_view(&previous, &zoom->target)) {
+    // Zoom limit reached, the target didn't move.
+    return;
+  }
+
+  zoom_start(win);
+}
+
+static void zoom_to_view(struct wooz_window *win,
+                         const struct wooz_boxf *view) {
+  win->zoom.target = *view;
+  zoom_start(win);
+}
+
+static void restore_view(struct wooz_window *win) {
+  zoom_to_view(win, &win->initial_view_source);
+}
+
+// Shifts the view, keeping a running zoom animation in sync.
+static void pan_view(struct wooz_window *win, double dx, double dy) {
+  win->view_source.x += dx;
+  win->view_source.y += dy;
+
+  if (win->zoom.active) {
+    win->zoom.from.x += dx;
+    win->zoom.from.y += dy;
+    win->zoom.target.x += dx;
+    win->zoom.target.y += dy;
+  }
+}
+
+static void zoom_animation_step(struct wooz_window *win) {
+  struct wooz_zoom *zoom = &win->zoom;
+
+  if (!zoom->active) {
+    return;
+  }
+
+  double t = (now_ms() - zoom->start_ms) / zoom->duration_ms;
+
+  if (t >= 1.0) {
+    win->view_source = zoom->target;
+    zoom->active = false;
+  } else {
+    double eased = ease_out_cubic(t);
+
+    win->view_source.x = zoom->from.x + (zoom->target.x - zoom->from.x) * eased;
+    win->view_source.y = zoom->from.y + (zoom->target.y - zoom->from.y) * eased;
+    win->view_source.width =
+        zoom->from.width + (zoom->target.width - zoom->from.width) * eased;
+    win->view_source.height =
+        zoom->from.height + (zoom->target.height - zoom->from.height) * eased;
+    zoom_request_frame(win);
+  }
+
+  // The nearest-neighbor path skips the commit when the sampled region didn't
+  // change; animation frames have to commit for the next callback to arrive.
+  win->sampled_valid = false;
+  render_window(win);
+}
+
 static void handle_key_action(struct wooz_state *state, uint32_t key) {
   struct wooz_window *win = state->focused;
   if (win == NULL) {
@@ -285,38 +459,34 @@ static void handle_key_action(struct wooz_state *state, uint32_t key) {
   case KEY_EQUAL: // For keyboards where + is shift+=
   case KEY_KPPLUS:
     // Zoom in at center
-    apply_zoom(win, KEYBOARD_ZOOM_STEP,
-               win->output->logical_geometry.width / 2.0,
-               win->output->logical_geometry.height / 2.0);
-    render_window(win);
+    zoom_by(win, KEYBOARD_ZOOM_STEP, win->output->logical_geometry.width / 2.0,
+            win->output->logical_geometry.height / 2.0);
     break;
 
   case KEY_MINUS:
   case KEY_KPMINUS:
     // Zoom out at center
-    apply_zoom(win, -KEYBOARD_ZOOM_STEP,
-               win->output->logical_geometry.width / 2.0,
-               win->output->logical_geometry.height / 2.0);
-    render_window(win);
+    zoom_by(win, -KEYBOARD_ZOOM_STEP, win->output->logical_geometry.width / 2.0,
+            win->output->logical_geometry.height / 2.0);
     break;
 
   case KEY_LEFT:
-    win->view_source.x -= KEYBOARD_PAN_STEP;
+    pan_view(win, -KEYBOARD_PAN_STEP, 0);
     render_window(win);
     break;
 
   case KEY_RIGHT:
-    win->view_source.x += KEYBOARD_PAN_STEP;
+    pan_view(win, KEYBOARD_PAN_STEP, 0);
     render_window(win);
     break;
 
   case KEY_UP:
-    win->view_source.y -= KEYBOARD_PAN_STEP;
+    pan_view(win, 0, -KEYBOARD_PAN_STEP);
     render_window(win);
     break;
 
   case KEY_DOWN:
-    win->view_source.y += KEYBOARD_PAN_STEP;
+    pan_view(win, 0, KEYBOARD_PAN_STEP);
     render_window(win);
     break;
   }
@@ -504,6 +674,8 @@ static const struct wl_output_listener output_listener = {
 // are covered by the ext-image-copy-capture cursor probe, and the screen center
 // is the last resort.
 //
+// The zoom itself is animated, like any other zoom gesture.
+//
 // Returns true when the zoom was applied, in which case the window has been
 // rendered.
 static bool apply_initial_zoom(struct wooz_window *win) {
@@ -535,9 +707,16 @@ static bool apply_initial_zoom(struct wooz_window *win) {
   }
 
   double zoom_pixels = output->geometry.height * config->initial_zoom;
-  apply_zoom(win, zoom_pixels, zoom_x, zoom_y);
+  win->zoom.target = win->view_source;
+  view_zoom(win, &win->zoom.target, zoom_pixels, zoom_x, zoom_y);
+  clamp_view(win, &win->zoom.target);
   win->initial_zoom_applied = true;
-  render_window(win);
+
+  // zoom_start() renders when it starts the animation; render once when the
+  // zoom is a no-op (e.g. already at the maximum zoom level).
+  if (!zoom_start(win)) {
+    render_window(win);
+  }
 
   return true;
 }
@@ -629,8 +808,7 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer,
     double dx = (x - win->pointer_x) * scale;
     double dy = (y - win->pointer_y) * scale;
 
-    win->view_source.x -= dx;
-    win->view_source.y -= dy;
+    pan_view(win, -dx, -dy);
     render_window(win);
   } else if (state->config.mouse_track) {
     // Mouse tracking: center viewport on mouse position
@@ -643,8 +821,7 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer,
     double dx = (new_center_x - viewport_center_x);
     double dy = (new_center_y - viewport_center_y);
 
-    win->view_source.x += dx;
-    win->view_source.y += dy;
+    pan_view(win, dx, dy);
     render_window(win);
   }
 
@@ -665,7 +842,6 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer,
           (time - win->last_click_time) < DOUBLE_CLICK_TIME_MS) {
         // Double-click detected - restore view
         restore_view(win);
-        render_window(win);
         win->last_click_time = 0;
       } else {
         win->last_click_time = time;
@@ -688,9 +864,10 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
 
-  double scale = win->view_source.width / win->output->geometry.width;
+  struct wooz_boxf *reference = zoom_reference(win);
+  double scale = reference->width / win->output->geometry.width;
   // x10 for faster zoom.
-  double scroll = wl_fixed_to_double(value) * scale * 10;
+  double scroll = wl_fixed_to_double(value) * 2 * scale * 10;
 
   // Invert scroll if configured
   if (state->config.invert_scroll) {
@@ -698,8 +875,7 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
   }
 
   if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-    apply_zoom(win, scroll, win->pointer_x, win->pointer_y);
-    render_window(win);
+    zoom_by(win, scroll, win->pointer_x, win->pointer_y);
   }
 }
 
@@ -762,7 +938,6 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
   case KEY_KP0:
     // Restore/unzoom
     restore_view(win);
-    render_window(win);
     break;
 
   case KEY_A:
@@ -1361,6 +1536,8 @@ int main(int argc, char *argv[]) {
       zwlr_layer_surface_v1_destroy(win->layer_surface);
     if (win->viewport != NULL)
       wp_viewport_destroy(win->viewport);
+    if (win->zoom.frame_callback != NULL)
+      wl_callback_destroy(win->zoom.frame_callback);
     if (win->surface != NULL)
       wl_surface_destroy(win->surface);
     for (int i = 0; i < WOOZ_SCALED_BUFFER_COUNT; ++i) {
