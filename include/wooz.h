@@ -8,6 +8,11 @@
 
 #include "box.h"
 
+// Number of buffers used to render the magnified region client-side (when
+// anti-aliasing is disabled). Using two buffers avoids writing to memory the
+// compositor is currently reading.
+#define WOOZ_SCALED_BUFFER_COUNT 2
+
 struct wooz_config {
   uint32_t close_key; // Linux input event code for close action (0 = default Esc)
   bool mouse_track;   // Enable mouse tracking
@@ -89,6 +94,22 @@ struct wooz_window {
 
   bool is_focused;
   bool initial_zoom_applied;
+  // Client-side nearest-neighbor rendering of the magnified region, used when
+  // anti-aliasing is disabled.
+  struct wooz_buffer *scaled_buffers[WOOZ_SCALED_BUFFER_COUNT];
+  int scaled_buffer_index;
+  bool antialias;
+
+  // Cached destination-x -> source-x mapping for the nearest-neighbor sampler
+  // (only depends on the sampled region and buffer widths).
+  int32_t *column_map;
+  int32_t column_map_src_width, column_map_dest_width;
+
+  // Source rectangle of the sampled buffer that is currently attached, used to
+  // skip resampling when a pan doesn't change what is sampled.
+  int32_t sampled_x, sampled_y, sampled_width, sampled_height;
+  int32_t sampled_buffer_width, sampled_buffer_height;
+  bool sampled_valid;
 };
 
 #endif

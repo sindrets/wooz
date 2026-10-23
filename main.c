@@ -24,6 +24,7 @@
 #define KEY_MINUS 12
 #define KEY_EQUAL 13
 #define KEY_Q 16
+#define KEY_A 30
 #define KEY_X 45
 #define KEY_KPMINUS 74
 #define KEY_KPPLUS 78
@@ -68,6 +69,158 @@ static void apply_zoom(struct wooz_window *win, double zoom_change,
   win->view_source.height -= round(scroll);
 }
 
+static bool is_32bit_shm_format(enum wl_shm_format format) {
+  return format == WL_SHM_FORMAT_ARGB8888 || format == WL_SHM_FORMAT_XRGB8888 ||
+         format == WL_SHM_FORMAT_ABGR8888 || format == WL_SHM_FORMAT_XBGR8888;
+}
+
+// The destination-x -> source-x mapping only depends on the two widths, so it
+// survives panning and is rebuilt only when the zoom level changes.
+static const int32_t *get_column_map(struct wooz_window *win, int32_t src_width,
+                                     int32_t dest_width) {
+  if (win->column_map != NULL && win->column_map_src_width == src_width &&
+      win->column_map_dest_width == dest_width) {
+    return win->column_map;
+  }
+
+  int32_t *map = realloc(win->column_map, (size_t)dest_width * sizeof(int32_t));
+  if (map == NULL) {
+    return NULL;
+  }
+
+  for (int32_t x = 0; x < dest_width; ++x) {
+    map[x] = (int32_t)((int64_t)x * src_width / dest_width);
+  }
+
+  win->column_map = map;
+  win->column_map_src_width = src_width;
+  win->column_map_dest_width = dest_width;
+  return map;
+}
+
+// Magnify the view source rectangle to the whole buffer using nearest-neighbor
+// sampling, bypassing the bilinear filtering the compositor applies when
+// scaling. Returns the buffer to attach, or NULL when client-side sampling
+// isn't possible (in which case the compositor is left to scale the viewport).
+// `*changed` is set to false when the sampled buffer is already attached and up
+// to date, in which case the caller has nothing to commit.
+static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
+                                                   bool *changed) {
+  struct wooz_buffer *src = win->output->buffer;
+
+  *changed = true;
+
+  // On rotated or flipped outputs the viewport is expressed in the surface
+  // local coordinate space, which doesn't match the pixel layout of the
+  // screencopy buffer. Leave the scaling to the compositor there.
+  if (win->output->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+    return NULL;
+  }
+
+  if (!is_32bit_shm_format(src->format) || src->width < 1 || src->height < 1) {
+    return NULL;
+  }
+
+  int32_t width = src->width;
+  int32_t height = src->height;
+
+  // Clamp the source rectangle to the buffer.
+  int32_t x0 = (int32_t)win->view_source.x;
+  int32_t y0 = (int32_t)win->view_source.y;
+  int32_t src_width = (int32_t)win->view_source.width;
+  int32_t src_height = (int32_t)win->view_source.height;
+  if (x0 < 0) {
+    src_width += x0;
+    x0 = 0;
+  }
+  if (y0 < 0) {
+    src_height += y0;
+    y0 = 0;
+  }
+  if (x0 + src_width > width) {
+    src_width = width - x0;
+  }
+  if (y0 + src_height > height) {
+    src_height = height - y0;
+  }
+  if (src_width < 1 || src_height < 1) {
+    return NULL;
+  }
+
+  // Panning by less than a source pixel samples the exact same pixels: keep the
+  // buffer that is already attached instead of resampling and re-uploading the
+  // whole screen.
+  if (win->sampled_valid && x0 == win->sampled_x && y0 == win->sampled_y &&
+      src_width == win->sampled_width && src_height == win->sampled_height &&
+      width == win->sampled_buffer_width &&
+      height == win->sampled_buffer_height) {
+    *changed = false;
+    return win->scaled_buffers[win->scaled_buffer_index];
+  }
+
+  // Alternate between two buffers so that the compositor doesn't read memory
+  // that is currently being written to.
+  int index = (win->scaled_buffer_index + 1) % WOOZ_SCALED_BUFFER_COUNT;
+  struct wooz_buffer *dst = win->scaled_buffers[index];
+  if (dst == NULL || dst->width != width || dst->height != height ||
+      dst->format != src->format) {
+    destroy_buffer(dst);
+    dst = create_buffer(win->state->shm, src->format, width, height, width * 4);
+    win->scaled_buffers[index] = dst;
+    if (dst == NULL) {
+      return NULL;
+    }
+  }
+  win->scaled_buffer_index = index;
+
+  const int32_t *columns = get_column_map(win, src_width, width);
+  if (columns == NULL) {
+    return NULL;
+  }
+
+  const uint32_t *src_data = src->data;
+  uint32_t *dst_data = dst->data;
+  size_t src_stride = (size_t)src->stride / sizeof(uint32_t);
+  size_t dst_stride = (size_t)dst->stride / sizeof(uint32_t);
+  const uint32_t *prev_src_row = NULL;
+  uint32_t *prev_dst_row = NULL;
+
+  for (int32_t y = 0; y < height; ++y) {
+    int32_t sy = (int32_t)((int64_t)y * src_height / height);
+    const uint32_t *src_row =
+        src_data + (size_t)(y0 + sy) * src_stride + (size_t)x0;
+    uint32_t *dst_row = dst_data + (size_t)y * dst_stride;
+
+    if (src_row == prev_src_row) {
+      // Magnification repeats source rows: duplicate the previous output row.
+      memcpy(dst_row, prev_dst_row, (size_t)width * sizeof(uint32_t));
+      continue;
+    }
+
+    prev_src_row = src_row;
+    prev_dst_row = dst_row;
+
+    if (src_width == width) {
+      memcpy(dst_row, src_row, (size_t)width * sizeof(uint32_t));
+      continue;
+    }
+
+    for (int32_t x = 0; x < width; ++x) {
+      dst_row[x] = src_row[columns[x]];
+    }
+  }
+
+  win->sampled_valid = true;
+  win->sampled_x = x0;
+  win->sampled_y = y0;
+  win->sampled_width = src_width;
+  win->sampled_height = src_height;
+  win->sampled_buffer_width = width;
+  win->sampled_buffer_height = height;
+
+  return dst;
+}
+
 static void render_window(struct wooz_window *win) {
   win->view_source.width =
       max(min(win->view_source.width, win->output->buffer->width),
@@ -81,11 +234,41 @@ static void render_window(struct wooz_window *win) {
                                                        win->view_source.height),
                            0);
 
-  wp_viewport_set_source(win->viewport,
-                         wl_fixed_from_double(win->view_source.x),
-                         wl_fixed_from_double(win->view_source.y),
-                         wl_fixed_from_double(win->view_source.width),
-                         wl_fixed_from_double(win->view_source.height));
+  struct wooz_buffer *buffer = NULL;
+  bool changed = true;
+
+  if (!win->antialias) {
+    buffer = render_nearest_neighbor(win, &changed);
+  }
+
+  if (!changed) {
+    // The sampled buffer is attached and up to date: nothing to commit.
+    return;
+  }
+
+  if (buffer != NULL) {
+    // Attach the magnified buffer as a whole so that the compositor doesn't
+    // filter the pixels sampled above.
+    wl_surface_attach(win->surface, buffer->wl_buffer, 0, 0);
+    wp_viewport_set_source(
+        win->viewport, wl_fixed_from_int(0), wl_fixed_from_int(0),
+        wl_fixed_from_int(buffer->width), wl_fixed_from_int(buffer->height));
+    wl_surface_damage_buffer(win->surface, 0, 0, buffer->width, buffer->height);
+  } else {
+    // Let the compositor crop and bilinearly scale the view source rectangle.
+    if (win->sampled_valid) {
+      // Switching away from the sampled buffer: repaint the whole surface.
+      wl_surface_damage_buffer(win->surface, 0, 0, win->output->buffer->width,
+                               win->output->buffer->height);
+      win->sampled_valid = false;
+    }
+    wl_surface_attach(win->surface, win->output->buffer->wl_buffer, 0, 0);
+    wp_viewport_set_source(win->viewport,
+                           wl_fixed_from_double(win->view_source.x),
+                           wl_fixed_from_double(win->view_source.y),
+                           wl_fixed_from_double(win->view_source.width),
+                           wl_fixed_from_double(win->view_source.height));
+  }
 
   wl_surface_commit(win->surface);
 }
@@ -315,7 +498,8 @@ static void layer_surface_handle_configure(
     uint32_t width, uint32_t height) {
   struct wooz_window *win = data;
   zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
-  wl_surface_attach(win->surface, win->output->buffer->wl_buffer, 0, 0);
+  // Force a render: the destination size below has to be committed.
+  win->sampled_valid = false;
   if (width != 0 && height != 0 && win->viewport != NULL) {
     wp_viewport_set_destination(win->viewport, width, height);
   }
@@ -335,12 +519,12 @@ static void layer_surface_handle_configure(
     double zoom_pixels =
         win->output->geometry.height * win->state->config.initial_zoom;
     apply_zoom(win, zoom_pixels, zoom_x, zoom_y);
-    render_window(win);
     win->initial_zoom_applied = true;
-    return; // render_window already calls wl_surface_commit
   }
 
-  wl_surface_commit(win->surface);
+  // Attaches the appropriate buffer (compositor-scaled or client-side sampled)
+  // and commits the surface.
+  render_window(win);
 }
 
 static void
@@ -543,6 +727,12 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
     render_window(win);
     break;
 
+  case KEY_A:
+    // Toggle anti-aliasing of the magnified region
+    win->antialias = !win->antialias;
+    render_window(win);
+    break;
+
   case KEY_EQUAL: // For keyboards where + is shift+=
   case KEY_KPPLUS:
   case KEY_MINUS:
@@ -693,6 +883,8 @@ static const char usage[] =
     "  +/-                     Zoom in/out at center\n"
     "  Arrow keys              Pan the view\n"
     "  0                       Restore/unzoom\n"
+    "  a                       Toggle anti-aliasing (nearest-neighbor when "
+    "off)\n"
     "  Esc                     Exit (default)\n";
 
 static bool should_include_output(struct wooz_output *output,
@@ -896,6 +1088,8 @@ int main(int argc, char *argv[]) {
     struct wooz_window *win = calloc(1, sizeof(struct wooz_window));
     wl_list_insert(&state.windows, &win->link);
     win->state = &state;
+    // Compositor scaling is bilinear: start with anti-aliasing enabled.
+    win->antialias = true;
     win->output = output;
     win->surface = wl_compositor_create_surface(state.compositor);
     win->viewport = wp_viewporter_get_viewport(state.viewporter, win->surface);
@@ -997,6 +1191,10 @@ int main(int argc, char *argv[]) {
       wp_viewport_destroy(win->viewport);
     if (win->surface != NULL)
       wl_surface_destroy(win->surface);
+    for (int i = 0; i < WOOZ_SCALED_BUFFER_COUNT; ++i) {
+      destroy_buffer(win->scaled_buffers[i]);
+    }
+    free(win->column_map);
     free(win);
 
     // Free output.

@@ -31,6 +31,8 @@ wooz [options...]
 * `+` / `-` - Zoom in/out at screen center
 * Arrow keys - Pan the view
 * `0` - Restore/unzoom to original view
+* `a` - Toggle anti-aliasing (when off, the magnified region is sampled with
+  nearest-neighbor interpolation instead of bilinear filtering)
 * `Esc` - Exit (default, customizable with `--map-close`)
 
 ### Examples
