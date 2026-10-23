@@ -130,14 +130,15 @@ struct wooz_window {
   int scaled_buffer_index;
   bool antialias;
 
-  // Cached destination-x -> source-x mapping for the nearest-neighbor sampler
-  // (only depends on the sampled region and buffer widths).
+  // Destination-x -> source-x mapping for the nearest-neighbor sampler.
   int32_t *column_map;
-  int32_t column_map_src_width, column_map_dest_width;
+  int32_t column_map_dest_width;
 
-  // Source rectangle of the sampled buffer that is currently attached, used to
-  // skip resampling when a pan doesn't change what is sampled.
-  int32_t sampled_x, sampled_y, sampled_width, sampled_height;
+  // Source rectangle and sampling grid of the attached buffer, used to skip
+  // resampling when a view change doesn't move the grid by a destination pixel.
+  int32_t sampled_x, sampled_y;
+  double sampled_phase_x, sampled_phase_y;
+  double sampled_step_x, sampled_step_y;
   int32_t sampled_buffer_width, sampled_buffer_height;
   bool sampled_valid;
 };

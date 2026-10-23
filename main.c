@@ -112,28 +112,29 @@ static bool is_32bit_shm_format(enum wl_shm_format format) {
          format == WL_SHM_FORMAT_ABGR8888 || format == WL_SHM_FORMAT_XBGR8888;
 }
 
-// The destination-x -> source-x mapping only depends on the two widths, so it
-// survives panning and is rebuilt only when the zoom level changes.
-static const int32_t *get_column_map(struct wooz_window *win, int32_t src_width,
-                                     int32_t dest_width) {
-  if (win->column_map != NULL && win->column_map_src_width == src_width &&
-      win->column_map_dest_width == dest_width) {
-    return win->column_map;
-  }
+// Builds the destination-x -> source-x mapping for `step` source pixels per
+// destination pixel, offset by `phase` (how far the view origin sits inside the
+// destination grid). It is rebuilt every frame because the phase changes as the
+// view moves, and a few thousand divisions are nothing next to the resampling.
+static const int32_t *get_column_map(struct wooz_window *win,
+                                     int32_t dest_width, double step,
+                                     double phase, int32_t max_column) {
+  if (win->column_map == NULL || win->column_map_dest_width != dest_width) {
+    int32_t *map =
+        realloc(win->column_map, (size_t)dest_width * sizeof(int32_t));
+    if (map == NULL) {
+      return NULL;
+    }
 
-  int32_t *map = realloc(win->column_map, (size_t)dest_width * sizeof(int32_t));
-  if (map == NULL) {
-    return NULL;
+    win->column_map = map;
+    win->column_map_dest_width = dest_width;
   }
 
   for (int32_t x = 0; x < dest_width; ++x) {
-    map[x] = (int32_t)((int64_t)x * src_width / dest_width);
+    win->column_map[x] = min((int32_t)floor(phase + x * step), max_column);
   }
 
-  win->column_map = map;
-  win->column_map_src_width = src_width;
-  win->column_map_dest_width = dest_width;
-  return map;
+  return win->column_map;
 }
 
 // Magnify the view source rectangle to the whole buffer using nearest-neighbor
@@ -162,34 +163,44 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
   int32_t width = src->width;
   int32_t height = src->height;
 
-  // Clamp the source rectangle to the buffer.
-  int32_t x0 = (int32_t)win->view_source.x;
-  int32_t y0 = (int32_t)win->view_source.y;
-  int32_t src_width = (int32_t)win->view_source.width;
-  int32_t src_height = (int32_t)win->view_source.height;
+  double step_x = win->view_source.width / (double)width;
+  double step_y = win->view_source.height / (double)height;
+  // The sampling grid is anchored at the fractional view origin: the fraction
+  // is carried as a destination-pixel phase so the magnified image slides one
+  // screen pixel at a time instead of jumping a whole source pixel.
+  if (step_x <= 0.0 || step_y <= 0.0) {
+    return NULL;
+  }
+
+  int32_t x0 = (int32_t)floor(win->view_source.x);
+  int32_t y0 = (int32_t)floor(win->view_source.y);
+  double phase_x = win->view_source.x - x0;
+  double phase_y = win->view_source.y - y0;
+
+  // Keep the sampled rectangle inside the buffer.
   if (x0 < 0) {
-    src_width += x0;
     x0 = 0;
+    phase_x = 0.0;
   }
   if (y0 < 0) {
-    src_height += y0;
     y0 = 0;
+    phase_y = 0.0;
   }
-  if (x0 + src_width > width) {
-    src_width = width - x0;
-  }
-  if (y0 + src_height > height) {
-    src_height = height - y0;
-  }
+
+  int32_t src_width =
+      min((int32_t)floor(phase_x + (width - 1) * step_x) + 1, width - x0);
+  int32_t src_height =
+      min((int32_t)floor(phase_y + (height - 1) * step_y) + 1, height - y0);
   if (src_width < 1 || src_height < 1) {
     return NULL;
   }
 
-  // Panning by less than a source pixel samples the exact same pixels: keep the
-  // buffer that is already attached instead of resampling and re-uploading the
-  // whole screen.
+  // A view change that doesn't move the sampling grid by a whole destination
+  // pixel samples the exact same pixels: keep the buffer that is already
+  // attached instead of resampling and re-uploading the whole screen.
   if (win->sampled_valid && x0 == win->sampled_x && y0 == win->sampled_y &&
-      src_width == win->sampled_width && src_height == win->sampled_height &&
+      phase_x == win->sampled_phase_x && phase_y == win->sampled_phase_y &&
+      step_x == win->sampled_step_x && step_y == win->sampled_step_y &&
       width == win->sampled_buffer_width &&
       height == win->sampled_buffer_height) {
     *changed = false;
@@ -211,7 +222,8 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
   }
   win->scaled_buffer_index = index;
 
-  const int32_t *columns = get_column_map(win, src_width, width);
+  const int32_t *columns =
+      get_column_map(win, width, step_x, phase_x, src_width - 1);
   if (columns == NULL) {
     return NULL;
   }
@@ -224,7 +236,7 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
   uint32_t *prev_dst_row = NULL;
 
   for (int32_t y = 0; y < height; ++y) {
-    int32_t sy = (int32_t)((int64_t)y * src_height / height);
+    int32_t sy = min((int32_t)floor(phase_y + y * step_y), src_height - 1);
     const uint32_t *src_row =
         src_data + (size_t)(y0 + sy) * src_stride + (size_t)x0;
     uint32_t *dst_row = dst_data + (size_t)y * dst_stride;
@@ -238,7 +250,7 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
     prev_src_row = src_row;
     prev_dst_row = dst_row;
 
-    if (src_width == width) {
+    if (step_x == 1.0 && phase_x == 0.0) {
       memcpy(dst_row, src_row, (size_t)width * sizeof(uint32_t));
       continue;
     }
@@ -251,8 +263,10 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
   win->sampled_valid = true;
   win->sampled_x = x0;
   win->sampled_y = y0;
-  win->sampled_width = src_width;
-  win->sampled_height = src_height;
+  win->sampled_phase_x = phase_x;
+  win->sampled_phase_y = phase_y;
+  win->sampled_step_x = step_x;
+  win->sampled_step_y = step_y;
   win->sampled_buffer_width = width;
   win->sampled_buffer_height = height;
 
@@ -359,6 +373,7 @@ static bool zoom_start(struct wooz_window *win) {
   if (zoom->duration_ms > ZOOM_ANIMATION_MAX_MS) {
     zoom->duration_ms = ZOOM_ANIMATION_MAX_MS;
   }
+
   zoom->start_ms = now_ms();
   zoom->active = true;
 
