@@ -98,6 +98,11 @@ struct wooz_zoom {
   struct wl_callback *frame_callback; // Paces the animation with repaints
 };
 
+// A run of destination pixels that all sample the same source column.
+struct wooz_run {
+  int32_t x;      // First destination pixel of the run
+  int32_t column; // Source column the run samples
+};
 struct wooz_window {
   struct wooz_state *state;
   struct wooz_output *output;
@@ -133,6 +138,11 @@ struct wooz_window {
   // Destination-x -> source-x mapping for the nearest-neighbor sampler.
   int32_t *column_map;
   int32_t column_map_dest_width;
+
+  // Runs of destination pixels sampling the same source column, used instead of
+  // the column map at high magnification (see RUN_FILL_MIN_STEP).
+  struct wooz_run *runs;
+  int32_t runs_capacity, run_count;
 
   // Source rectangle and sampling grid of the attached buffer, used to skip
   // resampling when a view change doesn't move the grid by a destination pixel.

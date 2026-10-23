@@ -54,6 +54,11 @@
 #define ZOOM_ANIMATION_DISTANCE_GAIN 2.0
 #define ZOOM_ANIMATION_MAX_MS 320.0
 
+// From 4x magnification on, the runs of destination pixels that sample the same
+// source column are long enough that filling them beats an indexed load per
+// pixel; below that the runs are too short and the loop overhead wins.
+#define RUN_FILL_MIN_STEP 0.25
+
 static double now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -135,6 +140,46 @@ static const int32_t *get_column_map(struct wooz_window *win,
   }
 
   return win->column_map;
+}
+
+// Builds the runs of destination pixels that sample the same source column,
+// from the same `step`/`phase` mapping as get_column_map().
+static bool build_runs(struct wooz_window *win, int32_t dest_width, double step,
+                       double phase, int32_t max_column) {
+  if (win->runs == NULL || win->runs_capacity < dest_width) {
+    struct wooz_run *runs =
+        realloc(win->runs, (size_t)dest_width * sizeof(struct wooz_run));
+    if (runs == NULL) {
+      return false;
+    }
+
+    win->runs = runs;
+    win->runs_capacity = dest_width;
+  }
+
+  int32_t count = 0;
+  int32_t x = 0;
+  while (x < dest_width) {
+    int32_t column = min((int32_t)floor(phase + x * step), max_column);
+
+    // The run ends where the mapping reaches the next source column (or the
+    // clamped edge, where the last column extends to the end).
+    int32_t next_x;
+    if (column >= max_column) {
+      next_x = dest_width;
+    } else {
+      next_x = (int32_t)ceil((column + 1 - phase) / step);
+      next_x = max(min(next_x, dest_width), x + 1);
+    }
+
+    win->runs[count].x = x;
+    win->runs[count].column = column;
+    ++count;
+    x = next_x;
+  }
+
+  win->run_count = count;
+  return true;
 }
 
 // Magnify the view source rectangle to the whole buffer using nearest-neighbor
@@ -222,10 +267,25 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
   }
   win->scaled_buffer_index = index;
 
-  const int32_t *columns =
-      get_column_map(win, width, step_x, phase_x, src_width - 1);
-  if (columns == NULL) {
-    return NULL;
+  // From 4x magnification on, fill runs of destination pixels instead of
+  // loading the source column for every pixel.
+  bool use_runs = step_x <= RUN_FILL_MIN_STEP;
+  const int32_t *columns = NULL;
+  const struct wooz_run *runs = NULL;
+  int32_t run_count = 0;
+
+  if (use_runs) {
+    if (!build_runs(win, width, step_x, phase_x, src_width - 1)) {
+      return NULL;
+    }
+
+    runs = win->runs;
+    run_count = win->run_count;
+  } else {
+    columns = get_column_map(win, width, step_x, phase_x, src_width - 1);
+    if (columns == NULL) {
+      return NULL;
+    }
   }
 
   const uint32_t *src_data = src->data;
@@ -255,8 +315,20 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
       continue;
     }
 
-    for (int32_t x = 0; x < width; ++x) {
-      dst_row[x] = src_row[columns[x]];
+    if (use_runs) {
+      for (int32_t r = 0; r < run_count; ++r) {
+        int32_t start = runs[r].x;
+        int32_t end = r + 1 < run_count ? runs[r + 1].x : width;
+        uint32_t value = src_row[runs[r].column];
+
+        for (int32_t x = start; x < end; ++x) {
+          dst_row[x] = value;
+        }
+      }
+    } else {
+      for (int32_t x = 0; x < width; ++x) {
+        dst_row[x] = src_row[columns[x]];
+      }
     }
   }
 
@@ -1559,6 +1631,7 @@ int main(int argc, char *argv[]) {
       destroy_buffer(win->scaled_buffers[i]);
     }
     free(win->column_map);
+    free(win->runs);
     free(win);
 
     // Free output.
