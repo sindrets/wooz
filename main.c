@@ -54,7 +54,7 @@
 // (e.g. zooming back out) gets more time.
 #define ZOOM_ANIMATION_MS 120.0
 #define ZOOM_ANIMATION_DISTANCE_GAIN 2.0
-#define ZOOM_ANIMATION_MAX_MS 320.0
+#define ZOOM_ANIMATION_MAX_MS 240.0
 
 // From 4x magnification on, the runs of destination pixels that sample the same
 // source column are long enough that filling them beats an indexed load per
