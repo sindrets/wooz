@@ -26,12 +26,14 @@ wooz [options...]
 
 **Mouse:**
 * Scroll wheel - Zoom in/out at mouse position
+* Ctrl + scroll - Zoom in/out at mouse position
 * Left click + drag - Pan the view
 * Right click - Exit
 * Double click - Restore/unzoom to original view
 
 **Touchpad:**
 * Two-finger scroll - Pan the view (both axes)
+* Ctrl + two-finger scroll - Zoom in/out at the fingers
 * Two-finger pinch - Zoom in/out at the fingers, and pan while pinching
 
 Touchpad support is detected at runtime through `pointer-gestures-unstable-v1`

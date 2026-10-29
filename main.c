@@ -40,6 +40,9 @@
 #define KEY_RIGHT 106
 #define KEY_DOWN 108
 
+// wl_keyboard.modifiers reports the compositor's xkb state, whose Ctrl bit
+// is 4.
+#define MODIFIER_CTRL 4
 #define min(x, y) (x < y ? x : y)
 #define max(x, y) (x > y ? x : y)
 
@@ -1183,6 +1186,22 @@ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer,
   // The continuous value drives zoom and pan.
 }
 
+// Applies one wheel step as a zoom, at the pointer.
+static void scroll_zoom(struct wooz_state *state, struct wooz_window *win,
+                        wl_fixed_t value) {
+  struct wooz_boxf *reference = zoom_reference(win);
+  double scale = reference->width / win->output->geometry.width;
+  // x10 for faster zoom.
+  double scroll = wl_fixed_to_double(value) * 2 * scale * 10;
+
+  // Invert scroll if configured
+  if (state->config.invert_scroll) {
+    scroll = -scroll;
+  }
+
+  zoom_by(win, scroll, win->pointer_x, win->pointer_y);
+}
+
 static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
                                 uint32_t time, uint32_t axis,
                                 wl_fixed_t value) {
@@ -1190,7 +1209,16 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
 
-  if (win == NULL) {
+  if (win == NULL || win->pinch_active) {
+    return;
+  }
+
+  // Ctrl+scroll zooms instead of panning, giving a trackpad an alternative to
+  // pinching.
+  if ((state->modifiers & MODIFIER_CTRL) != 0) {
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+      scroll_zoom(state, win, value);
+    }
     return;
   }
 
@@ -1210,25 +1238,9 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
     return;
   }
 
-  if (win->pinch_active) {
-    return;
+  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    scroll_zoom(state, win, value);
   }
-
-  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
-    return;
-  }
-
-  struct wooz_boxf *reference = zoom_reference(win);
-  double scale = reference->width / win->output->geometry.width;
-  // x10 for faster zoom.
-  double scroll = wl_fixed_to_double(value) * 2 * scale * 10;
-
-  // Invert scroll if configured
-  if (state->config.invert_scroll) {
-    scroll = -scroll;
-  }
-
-  zoom_by(win, scroll, win->pointer_x, win->pointer_y);
 }
 
 // Touchpad pinch: scale is absolute since the gesture began, so each update
@@ -1357,7 +1369,11 @@ static void keyboard_handle_enter(void *data, struct wl_keyboard *keyboard,
 
 static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
                                   uint32_t serial, struct wl_surface *surface) {
-  // No-op
+  struct wooz_state *state = data;
+
+  // No modifiers event follows a leave, so clear them here rather than leave a
+  // stale Ctrl behind.
+  state->modifiers = 0;
 }
 
 static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
@@ -1425,7 +1441,9 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard,
                                       uint32_t serial, uint32_t mods_depressed,
                                       uint32_t mods_latched,
                                       uint32_t mods_locked, uint32_t group) {
-  // No-op
+  struct wooz_state *state = data;
+
+  state->modifiers = mods_depressed;
 }
 
 static void keyboard_handle_repeat_info(void *data,
@@ -1444,8 +1462,7 @@ static const struct wl_keyboard_listener keyboard_listener = {
 };
 
 static void seat_handle_name(void *data, struct wl_seat *seat,
-                             const char *name) {
-}
+                             const char *name) {}
 
 static void seat_handle_capabilities(void *data, struct wl_seat *seat,
                                      uint32_t capabilities) {
@@ -1594,6 +1611,7 @@ static const char usage[] =
     "\n"
     "Controls:\n"
     "  Mouse scroll            Zoom in/out at mouse position\n"
+    "  Ctrl + scroll           Zoom in/out at mouse position\n"
     "  Left click + drag       Pan the view\n"
     "  Two-finger scroll       Pan the view (touchpad)\n"
     "  Two-finger pinch        Zoom in/out at the fingers (touchpad)\n"

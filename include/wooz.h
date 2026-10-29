@@ -46,6 +46,8 @@ struct wooz_state {
   // Axis source of the current frame (enum wl_pointer_axis_source):
   // WL_POINTER_AXIS_SOURCE_FINGER pans, anything else zooms.
   uint32_t axis_source;
+  // Depressed keyboard modifiers (enum wl_keyboard_modifier).
+  uint32_t modifiers;
   struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
   struct wp_cursor_shape_device_v1 *cursor_shape_device;
   struct wl_keyboard *keyboard;
