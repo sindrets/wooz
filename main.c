@@ -18,6 +18,7 @@
 #include "cursor-shape-v1-protocol.h"
 #include "ext-image-capture-source-v1-protocol.h"
 #include "ext-image-copy-capture-v1-protocol.h"
+#include "pointer-gestures-unstable-v1-protocol.h"
 #include "viewporter-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "wlr-screencopy-unstable-v1-protocol.h"
@@ -1158,12 +1159,64 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer,
   }
 }
 
+static void pointer_handle_axis_source(void *data, struct wl_pointer *pointer,
+                                       uint32_t axis_source) {
+  struct wooz_state *state = data;
+
+  state->axis_source = axis_source;
+}
+
+static void pointer_handle_frame(void *data, struct wl_pointer *pointer) {
+  // Default when the compositor sends no axis_source for the next frame.
+  struct wooz_state *state = data;
+
+  state->axis_source = WL_POINTER_AXIS_SOURCE_WHEEL;
+}
+
+static void pointer_handle_axis_stop(void *data, struct wl_pointer *pointer,
+                                     uint32_t time, uint32_t axis) {
+  // No kinetic scrolling.
+}
+
+static void pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer,
+                                         uint32_t axis, int32_t discrete) {
+  // The continuous value drives zoom and pan.
+}
+
 static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
                                 uint32_t time, uint32_t axis,
                                 wl_fixed_t value) {
 
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
+
+  if (win == NULL) {
+    return;
+  }
+
+  // Touchpad scrolling pans in both dimensions.
+  if (state->axis_source == WL_POINTER_AXIS_SOURCE_FINGER &&
+      state->pinch != NULL) {
+    double pan_scale =
+        zoom_reference(win)->width / win->output->logical_geometry.width;
+    double delta = wl_fixed_to_double(value) * pan_scale;
+
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
+      pan_view(win, 0.0, delta);
+    } else {
+      pan_view(win, delta, 0.0);
+    }
+    render_window(win);
+    return;
+  }
+
+  if (win->pinch_active) {
+    return;
+  }
+
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
+    return;
+  }
 
   struct wooz_boxf *reference = zoom_reference(win);
   double scale = reference->width / win->output->geometry.width;
@@ -1175,10 +1228,109 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer,
     scroll = -scroll;
   }
 
-  if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-    zoom_by(win, scroll, win->pointer_x, win->pointer_y);
-  }
+  zoom_by(win, scroll, win->pointer_x, win->pointer_y);
 }
+
+// Touchpad pinch: scale is absolute since the gesture began, so each update
+// rebuilds the view from pinch_base with the anchored pixel held under the
+// fingers.
+static void pinch_handle_begin(void *data,
+                               struct zwp_pointer_gesture_pinch_v1 *pinch,
+                               uint32_t serial, uint32_t time,
+                               struct wl_surface *surface, uint32_t fingers) {
+  struct wooz_state *state = data;
+  struct wooz_window *win = state->focused;
+
+  if (win == NULL) {
+    return;
+  }
+
+  // The gesture starts from the displayed view.
+  win->zoom.active = false;
+
+  double width = win->output->logical_geometry.width;
+  double height = win->output->logical_geometry.height;
+
+  // Pinch around the pointer, or the screen center without one.
+  double center_x = win->pointer_x >= 0.0 ? win->pointer_x : width / 2.0;
+  double center_y = win->pointer_y >= 0.0 ? win->pointer_y : height / 2.0;
+
+  win->pinch_active = true;
+  win->pinch_base = win->view_source;
+  win->pinch_center_x = center_x;
+  win->pinch_center_y = center_y;
+  win->pinch_dx = 0.0;
+  win->pinch_dy = 0.0;
+
+  // The source pixel the fingers hold.
+  win->pinch_anchor_x =
+      win->view_source.x + (center_x / width) * win->view_source.width;
+  win->pinch_anchor_y =
+      win->view_source.y + (center_y / height) * win->view_source.height;
+}
+
+static void pinch_handle_update(void *data,
+                                struct zwp_pointer_gesture_pinch_v1 *pinch,
+                                uint32_t time, wl_fixed_t dx, wl_fixed_t dy,
+                                wl_fixed_t scale, wl_fixed_t rotation) {
+  struct wooz_state *state = data;
+  struct wooz_window *win = state->focused;
+
+  if (win == NULL || !win->pinch_active) {
+    return;
+  }
+
+  double factor = wl_fixed_to_double(scale);
+  if (factor <= 0.0) {
+    return;
+  }
+
+  win->pinch_dx += wl_fixed_to_double(dx);
+  win->pinch_dy += wl_fixed_to_double(dy);
+
+  double width = win->output->logical_geometry.width;
+  double height = win->output->logical_geometry.height;
+
+  // Spreading the fingers (factor > 1) zooms in and shrinks the view.
+  struct wooz_boxf view = {
+      .width = win->pinch_base.width / factor,
+      .height = win->pinch_base.height / factor,
+  };
+
+  // Holding the anchor under the translated fingers pans as well.
+  double center_x = win->pinch_center_x + win->pinch_dx;
+  double center_y = win->pinch_center_y + win->pinch_dy;
+  view.x = win->pinch_anchor_x - (center_x / width) * view.width;
+  view.y = win->pinch_anchor_y - (center_y / height) * view.height;
+
+  win->view_source = view;
+  render_window(win);
+}
+
+static void pinch_handle_end(void *data,
+                             struct zwp_pointer_gesture_pinch_v1 *pinch,
+                             uint32_t serial, uint32_t time,
+                             int32_t cancelled) {
+  struct wooz_state *state = data;
+  struct wooz_window *win = state->focused;
+
+  if (win == NULL) {
+    return;
+  }
+
+  if (win->pinch_active && cancelled) {
+    win->view_source = win->pinch_base;
+    render_window(win);
+  }
+
+  win->pinch_active = false;
+}
+
+static const struct zwp_pointer_gesture_pinch_v1_listener pinch_listener = {
+    .begin = pinch_handle_begin,
+    .update = pinch_handle_update,
+    .end = pinch_handle_end,
+};
 
 static const struct wl_pointer_listener pointer_listener = {
     .enter = pointer_handle_enter,
@@ -1186,6 +1338,10 @@ static const struct wl_pointer_listener pointer_listener = {
     .motion = pointer_handle_motion,
     .button = pointer_handle_button,
     .axis = pointer_handle_axis,
+    .axis_source = pointer_handle_axis_source,
+    .frame = pointer_handle_frame,
+    .axis_stop = pointer_handle_axis_stop,
+    .axis_discrete = pointer_handle_axis_discrete,
 };
 
 static void keyboard_handle_keymap(void *data, struct wl_keyboard *keyboard,
@@ -1287,6 +1443,10 @@ static const struct wl_keyboard_listener keyboard_listener = {
     .repeat_info = keyboard_handle_repeat_info,
 };
 
+static void seat_handle_name(void *data, struct wl_seat *seat,
+                             const char *name) {
+}
+
 static void seat_handle_capabilities(void *data, struct wl_seat *seat,
                                      uint32_t capabilities) {
   struct wooz_state *state = data;
@@ -1298,9 +1458,26 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat,
       state->cursor_shape_device = wp_cursor_shape_manager_v1_get_pointer(
           state->cursor_shape_manager, state->pointer);
     }
+    // A pinch object references the pointer, so it is created alongside it.
+    if (state->pointer_gestures != NULL && state->pinch == NULL) {
+      state->pinch = zwp_pointer_gestures_v1_get_pinch_gesture(
+          state->pointer_gestures, state->pointer);
+      zwp_pointer_gesture_pinch_v1_add_listener(state->pinch, &pinch_listener,
+                                                state);
+    }
   } else {
+    // The pinch object references the pointer, so it goes first.
+    if (state->pinch != NULL) {
+      zwp_pointer_gesture_pinch_v1_destroy(state->pinch);
+      state->pinch = NULL;
+    }
     if (state->pointer != NULL) {
-      wl_pointer_destroy(state->pointer);
+      if (wl_pointer_get_version(state->pointer) >=
+          WL_POINTER_RELEASE_SINCE_VERSION) {
+        wl_pointer_release(state->pointer);
+      } else {
+        wl_pointer_destroy(state->pointer);
+      }
       state->pointer = NULL;
     }
     if (state->cursor_shape_device != NULL) {
@@ -1322,6 +1499,7 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat,
 
 static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_handle_capabilities,
+    .name = seat_handle_name,
 };
 
 static void handle_global(void *data, struct wl_registry *registry,
@@ -1357,8 +1535,17 @@ static void handle_global(void *data, struct wl_registry *registry,
     state->viewporter =
         wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
   } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-    state->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+    // Version 5 brings axis_source, which tells touchpad scrolling from the
+    // wheel.
+    uint32_t seat_version = version > 5 ? 5 : version;
+    state->seat =
+        wl_registry_bind(registry, name, &wl_seat_interface, seat_version);
     wl_seat_add_listener(state->seat, &seat_listener, state);
+  } else if (strcmp(interface, zwp_pointer_gestures_v1_interface.name) == 0) {
+    // Optional: without it there is no pinch-to-zoom.
+    uint32_t gestures_version = version > 2 ? 2 : version;
+    state->pointer_gestures = wl_registry_bind(
+        registry, name, &zwp_pointer_gestures_v1_interface, gestures_version);
   } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) ==
              0) {
     state->cursor_shape_manager = wl_registry_bind(
@@ -1408,6 +1595,8 @@ static const char usage[] =
     "Controls:\n"
     "  Mouse scroll            Zoom in/out at mouse position\n"
     "  Left click + drag       Pan the view\n"
+    "  Two-finger scroll       Pan the view (touchpad)\n"
+    "  Two-finger pinch        Zoom in/out at the fingers (touchpad)\n"
     "  Right click             Exit\n"
     "  Double click            Restore/unzoom\n"
     "  +/-                     Zoom in/out at center\n"
@@ -1880,13 +2069,33 @@ int main(int argc, char *argv[]) {
   if (state.cursor_shape_manager) {
     wp_cursor_shape_manager_v1_destroy(state.cursor_shape_manager);
   }
+  if (state.pinch) {
+    zwp_pointer_gesture_pinch_v1_destroy(state.pinch);
+  }
+  if (state.pointer_gestures) {
+    if (zwp_pointer_gestures_v1_get_version(state.pointer_gestures) >=
+        ZWP_POINTER_GESTURES_V1_RELEASE_SINCE_VERSION) {
+      zwp_pointer_gestures_v1_release(state.pointer_gestures);
+    } else {
+      zwp_pointer_gestures_v1_destroy(state.pointer_gestures);
+    }
+  }
   if (state.pointer) {
-    wl_pointer_release(state.pointer);
+    if (wl_pointer_get_version(state.pointer) >=
+        WL_POINTER_RELEASE_SINCE_VERSION) {
+      wl_pointer_release(state.pointer);
+    } else {
+      wl_pointer_destroy(state.pointer);
+    }
   }
   if (state.keyboard) {
     wl_keyboard_release(state.keyboard);
   }
-  wl_seat_release(state.seat);
+  if (wl_seat_get_version(state.seat) >= WL_SEAT_RELEASE_SINCE_VERSION) {
+    wl_seat_release(state.seat);
+  } else {
+    wl_seat_destroy(state.seat);
+  }
   zwlr_layer_shell_v1_destroy(state.layer_shell);
   wp_viewporter_destroy(state.viewporter);
   wl_shm_destroy(state.shm);

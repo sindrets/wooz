@@ -41,6 +41,11 @@ struct wooz_state {
   struct wp_viewporter *viewporter;
   struct wl_seat *seat;
   struct wl_pointer *pointer;
+  struct zwp_pointer_gestures_v1 *pointer_gestures;
+  struct zwp_pointer_gesture_pinch_v1 *pinch;
+  // Axis source of the current frame (enum wl_pointer_axis_source):
+  // WL_POINTER_AXIS_SOURCE_FINGER pans, anything else zooms.
+  uint32_t axis_source;
   struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
   struct wp_cursor_shape_device_v1 *cursor_shape_device;
   struct wl_keyboard *keyboard;
@@ -124,6 +129,16 @@ struct wooz_window {
   double pointer_x;
   double pointer_y;
   bool pointer_pressed;
+
+  // Pinch gesture (touchpad) state. The view is derived from pinch_base and the
+  // fingers' translation, both measured from the start of the gesture.
+  bool pinch_active;
+  struct wooz_boxf pinch_base;
+  // Source pixel under the fingers when the gesture began, and the logical
+  // position it began at.
+  double pinch_anchor_x, pinch_anchor_y;
+  double pinch_center_x, pinch_center_y;
+  double pinch_dx, pinch_dy;
 
   // Double-click detection
   uint32_t last_click_time;

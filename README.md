@@ -30,6 +30,14 @@ wooz [options...]
 * Right click - Exit
 * Double click - Restore/unzoom to original view
 
+**Touchpad:**
+* Two-finger scroll - Pan the view (both axes)
+* Two-finger pinch - Zoom in/out at the fingers, and pan while pinching
+
+Touchpad support is detected at runtime through `pointer-gestures-unstable-v1`
+and the `finger` axis source; when the compositor provides neither, a touchpad
+keeps working like a mouse (scroll to zoom, click and drag to pan).
+
 **Keyboard:**
 * `+` / `-` - Zoom in/out at screen center
 * Arrow keys - Pan the view
