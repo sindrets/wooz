@@ -170,6 +170,7 @@ struct wooz_window {
   double sampled_phase_x, sampled_phase_y;
   double sampled_step_x, sampled_step_y;
   int32_t sampled_buffer_width, sampled_buffer_height;
+  enum wl_shm_format sampled_format;
   bool sampled_valid;
 };
 

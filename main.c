@@ -127,9 +127,31 @@ static void view_zoom(struct wooz_window *win, struct wooz_boxf *view,
   view->height -= round(scroll);
 }
 
+// Every format the sampler can handle: 32 bits per pixel, one pixel per 32-bit
+// word, so a pixel is copied verbatim. The 2101010/1010102 family of formats
+// is returned by screencopy when the compositor is rendering 10-bit output.
 static bool is_32bit_shm_format(enum wl_shm_format format) {
-  return format == WL_SHM_FORMAT_ARGB8888 || format == WL_SHM_FORMAT_XRGB8888 ||
-         format == WL_SHM_FORMAT_ABGR8888 || format == WL_SHM_FORMAT_XBGR8888;
+  switch (format) {
+  case WL_SHM_FORMAT_ARGB8888:
+  case WL_SHM_FORMAT_XRGB8888:
+  case WL_SHM_FORMAT_ABGR8888:
+  case WL_SHM_FORMAT_XBGR8888:
+  case WL_SHM_FORMAT_RGBA8888:
+  case WL_SHM_FORMAT_BGRA8888:
+  case WL_SHM_FORMAT_RGBX8888:
+  case WL_SHM_FORMAT_BGRX8888:
+  case WL_SHM_FORMAT_XRGB2101010:
+  case WL_SHM_FORMAT_XBGR2101010:
+  case WL_SHM_FORMAT_ARGB2101010:
+  case WL_SHM_FORMAT_ABGR2101010:
+  case WL_SHM_FORMAT_RGBX1010102:
+  case WL_SHM_FORMAT_BGRX1010102:
+  case WL_SHM_FORMAT_RGBA1010102:
+  case WL_SHM_FORMAT_BGRA1010102:
+    return true;
+  default:
+    return false;
+  }
 }
 
 // Builds the destination-x -> source-x mapping for `step` source pixels per
@@ -477,7 +499,8 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
       phase_x == win->sampled_phase_x && phase_y == win->sampled_phase_y &&
       step_x == win->sampled_step_x && step_y == win->sampled_step_y &&
       width == win->sampled_buffer_width &&
-      height == win->sampled_buffer_height) {
+      height == win->sampled_buffer_height &&
+      src->format == win->sampled_format) {
     *changed = false;
     return win->scaled_buffers[win->scaled_buffer_index];
   }
@@ -559,6 +582,7 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
   win->sampled_step_y = step_y;
   win->sampled_buffer_width = width;
   win->sampled_buffer_height = height;
+  win->sampled_format = src->format;
 
   return dst;
 }
