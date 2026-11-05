@@ -16,8 +16,6 @@
 #include "wooz.h"
 
 #include "cursor-shape-v1-protocol.h"
-#include "ext-image-capture-source-v1-protocol.h"
-#include "ext-image-copy-capture-v1-protocol.h"
 #include "pointer-gestures-unstable-v1-protocol.h"
 #include "viewporter-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
@@ -588,6 +586,11 @@ static struct wooz_buffer *render_nearest_neighbor(struct wooz_window *win,
 }
 
 static void render_window(struct wooz_window *win) {
+  if (win->placeholder) {
+    // Nothing to render before the frame has been copied.
+    return;
+  }
+
   clamp_view(win, &win->view_source);
 
   struct wooz_buffer *buffer = NULL;
@@ -857,7 +860,8 @@ static bool is_repeatable_key(uint32_t key) {
 static void screencopy_frame_handle_buffer(
     void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t format,
     uint32_t width, uint32_t height, uint32_t stride) {
-  struct wooz_output *output = data;
+  struct wooz_window *win = data;
+  struct wooz_output *output = win->output;
 
   output->buffer =
       create_buffer(output->state->shm, format, width, height, stride);
@@ -876,25 +880,33 @@ static void screencopy_frame_handle_buffer(
   zwlr_screencopy_frame_v1_copy(frame, output->buffer->wl_buffer);
 }
 
+static bool apply_initial_zoom(struct wooz_window *win);
+static void capture_window_done(struct wooz_window *win, bool failed);
+
 static void screencopy_frame_handle_flags(
     void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t flags) {
-  struct wooz_output *output = data;
-  output->screencopy_frame_flags = flags;
+  // No-op: the frame is copied as a whole, so its damage is of no interest.
 }
 
 static void screencopy_frame_handle_ready(
     void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t tv_sec_hi,
     uint32_t tv_sec_lo, uint32_t tv_nsec) {
-  struct wooz_output *output = data;
-  ++output->state->n_done;
+  struct wooz_window *win = data;
+
+  ++win->state->n_done;
+  capture_window_done(win, false);
+
+  zwlr_screencopy_frame_v1_destroy(win->screencopy_frame);
+  win->screencopy_frame = NULL;
 }
 
 static void
 screencopy_frame_handle_failed(void *data,
                                struct zwlr_screencopy_frame_v1 *frame) {
-  struct wooz_output *output = data;
-  fprintf(stderr, "failed to copy output %s\n", output->name);
-  exit(EXIT_FAILURE);
+  struct wooz_window *win = data;
+
+  fprintf(stderr, "failed to copy the screen\n");
+  win->state->running = false;
 }
 
 static const struct zwlr_screencopy_frame_v1_listener
@@ -904,6 +916,65 @@ static const struct zwlr_screencopy_frame_v1_listener
         .ready = screencopy_frame_handle_ready,
         .failed = screencopy_frame_handle_failed,
 };
+
+// Size of the transparent placeholder the surfaces are mapped with, while the
+// frames are being copied. As small as a surface can be: it is transparent, but
+// compositors that ignore the viewport would still show it.
+#define PLACEHOLDER_SIZE 1
+
+// Maps a window with a fully transparent buffer: the compositor only reports
+// pointer focus (and with it the serial needed to hide the pointer) once a
+// surface has a buffer, and the screens still to be copied are beneath the
+// surfaces anyway, so nothing has to be covered up.
+static struct wl_buffer *capture_placeholder_buffer(struct wooz_state *state) {
+  if (state->placeholder_buffer != NULL) {
+    return state->placeholder_buffer;
+  }
+
+  struct wooz_buffer *buffer =
+      create_buffer(state->shm, WL_SHM_FORMAT_ARGB8888, PLACEHOLDER_SIZE,
+                    PLACEHOLDER_SIZE, PLACEHOLDER_SIZE * 4);
+  if (buffer == NULL) {
+    return NULL;
+  }
+
+  // Zeroed is fully transparent, for premultiplied ARGB8888.
+  memset(buffer->data, 0, buffer->size);
+
+  state->placeholder_buffer = buffer->wl_buffer;
+  buffer->wl_buffer = NULL;
+  destroy_buffer(buffer);
+
+  return state->placeholder_buffer;
+}
+
+// Maps a window with the placeholder, covering up as little as possible: it is
+// transparent, and every screen still to be copied is beneath it anyway.
+static void capture_show_placeholder(struct wooz_window *win) {
+  struct wl_buffer *buffer = capture_placeholder_buffer(win->state);
+  if (buffer == NULL) {
+    return;
+  }
+
+  win->placeholder = true;
+
+  wl_surface_attach(win->surface, buffer, 0, 0);
+  wp_viewport_set_source(win->viewport, wl_fixed_from_int(-1),
+                         wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                         wl_fixed_from_int(-1));
+  wl_surface_damage_buffer(win->surface, 0, 0, PLACEHOLDER_SIZE,
+                           PLACEHOLDER_SIZE);
+  wl_surface_commit(win->surface);
+}
+
+static void xdg_output_handle_name(void *data,
+                                   struct zxdg_output_v1 *xdg_output,
+                                   const char *name) {
+  struct wooz_output *output = data;
+
+  free(output->xdg_output_name);
+  output->xdg_output_name = strdup(name);
+}
 
 static void xdg_output_handle_logical_position(
     void *data, struct zxdg_output_v1 *xdg_output, int32_t x, int32_t y) {
@@ -931,13 +1002,6 @@ static void xdg_output_handle_done(void *data,
   output->logical_scale = (double)width / output->logical_geometry.width;
   output->ratio = (double)output->logical_geometry.width /
                   (double)output->logical_geometry.height;
-}
-
-static void xdg_output_handle_name(void *data,
-                                   struct zxdg_output_v1 *xdg_output,
-                                   const char *name) {
-  struct wooz_output *output = data;
-  output->name = strdup(name);
 }
 
 static void xdg_output_handle_description(void *data,
@@ -998,10 +1062,10 @@ static const struct wl_output_listener output_listener = {
 // --zoom-at, on the pointer when its position is known, or on the screen
 // center.
 //
-// The wl_pointer position is preferred when the compositor reports it before
-// the first configure. Compositors that only report it once the pointer moves
-// are covered by the ext-image-copy-capture cursor probe, and the screen center
-// is the last resort.
+// The position comes from wl_pointer: the placeholder surface gets pointer
+// focus as soon as it is mapped, and the enter event then reports where the
+// pointer is, without it having to be moved there first. The screen center is
+// the last resort.
 //
 // The zoom itself is animated, like any other zoom gesture.
 //
@@ -1021,15 +1085,9 @@ static bool apply_initial_zoom(struct wooz_window *win) {
   if (config->zoom_at) {
     zoom_x = config->zoom_at_x;
     zoom_y = config->zoom_at_y;
-  } else if (win->pointer_x >= 0.0 && win->pointer_y >= 0.0) {
-    zoom_x = win->pointer_x;
-    zoom_y = win->pointer_y;
-  } else if (output->cursor_known &&
-             output->transform == WL_OUTPUT_TRANSFORM_NORMAL) {
-    // The cursor probe reports the hotspot in the output's buffer pixels.
-    double scale = output->logical_scale > 0.0 ? output->logical_scale : 1.0;
-    zoom_x = output->cursor_x / scale;
-    zoom_y = output->cursor_y / scale;
+  } else if (win->pointer_entered) {
+    zoom_x = win->pointer_enter_x;
+    zoom_y = win->pointer_enter_y;
   } else {
     zoom_x = output->logical_geometry.width / 2.0;
     zoom_y = output->logical_geometry.height / 2.0;
@@ -1043,7 +1101,7 @@ static bool apply_initial_zoom(struct wooz_window *win) {
 
   // zoom_start() renders when it starts the animation; render once when the
   // zoom is a no-op (e.g. already at the maximum zoom level).
-  if (!zoom_start(win)) {
+  if (!zoom_start(win) && !win->placeholder) {
     render_window(win);
   }
 
@@ -1063,8 +1121,18 @@ static void layer_surface_handle_configure(
 
   win->configured = true;
 
-  // Zoom onto the pointer if its position is known, and onto the screen center
-  // otherwise.
+  // The surface is mapped with the placeholder first: the compositor gives it
+  // pointer focus, and with it the serial needed to hide the pointer.
+  if (!win->frame_ready) {
+    if (!win->placeholder) {
+      capture_show_placeholder(win);
+    }
+    return;
+  }
+
+  // The zoom is applied on the copied frame, so there is nothing to render
+  // before it has arrived (see capture_window_done()).
+  win->placeholder = false;
   if (!apply_initial_zoom(win)) {
     render_window(win);
   }
@@ -1074,13 +1142,99 @@ static void
 layer_surface_handle_closed(void *data,
                             struct zwlr_layer_surface_v1 *layer_surface) {
   struct wooz_window *win = data;
-  win->state->n_done = 0;
+  win->state->running = false;
 }
 
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
     .configure = layer_surface_handle_configure,
     .closed = layer_surface_handle_closed,
 };
+
+// Hides the pointer image. While the compositor uses software cursors (i.e.
+// during screenshare), the pointer is composited into the output buffer and
+// screencopy hands that buffer out as is: hiding it is the only way to keep it
+// out of the copies. Compositors generally only accept this from the client
+// with pointer focus, and only with the serial of the enter event.
+static void capture_hide_cursor(struct wooz_state *state) {
+  state->input_during_capture = false;
+
+  if (state->pointer == NULL || !state->enter_serial_valid) {
+    // No pointer focus, so the pointer is not on any of our surfaces and can't
+    // be hidden; whatever the compositor does with it is what ends up in the
+    // copies.
+    return;
+  }
+
+  wl_pointer_set_cursor(state->pointer, state->enter_serial, NULL, 0, 0);
+  state->capture_cursor_hidden = true;
+}
+
+// Brings the pointer image back, unless the pointer moved since the copies were
+// requested: the compositor may then have drawn it into one of them, and a
+// pointer frozen into the magnified frame is worse than one that stays hidden
+// until it moves again.
+static void capture_restore_cursor(struct wooz_state *state) {
+  if (!state->capture_cursor_hidden) {
+    return;
+  }
+
+  if (state->input_during_capture || state->pointer == NULL ||
+      !state->enter_serial_valid) {
+    return;
+  }
+
+  // The shape protocol is the only way to name a cursor image without shipping
+  // one; compositors without it keep the pointer hidden until it moves, which
+  // re-applies the image from the focus path.
+  if (state->cursor_shape_device != NULL) {
+    wp_cursor_shape_device_v1_set_shape(
+        state->cursor_shape_device, state->enter_serial,
+        WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+    state->capture_cursor_hidden = false;
+  }
+}
+
+static void capture_start(struct wooz_window *win) {
+  struct wooz_state *state = win->state;
+
+  // Without the cursor overlay: the pointer image is hidden, and asking for it
+  // would make the compositor draw it into the frame.
+  win->screencopy_frame = zwlr_screencopy_manager_v1_capture_output(
+      state->screencopy_manager, false, win->output->wl_output);
+  if (win->screencopy_frame == NULL) {
+    return;
+  }
+
+  zwlr_screencopy_frame_v1_add_listener(win->screencopy_frame,
+                                        &screencopy_frame_listener, win);
+  ++state->n_capture;
+}
+
+// Shows the copied frame in a window, and brings the pointer back once the last
+// copy is in.
+static void capture_window_done(struct wooz_window *win, bool failed) {
+  struct wooz_state *state = win->state;
+
+  if (!failed && win->output->buffer != NULL) {
+    win->frame_ready = true;
+
+    // Now that there is a frame to show: zoom onto the pointer if its position
+    // is known, and onto the screen center otherwise.
+    if (win->configured) {
+      win->placeholder = false;
+      if (!apply_initial_zoom(win)) {
+        render_window(win);
+      }
+    }
+  }
+
+  if (state->n_done < state->n_capture) {
+    return;
+  }
+
+  state->windows_pending = false;
+  capture_restore_cursor(state);
+}
 
 static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
                                  uint32_t serial, struct wl_surface *surface,
@@ -1089,15 +1243,27 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
 
   struct wooz_window *window;
   wl_list_for_each(window, &state->windows, link) {
-    if (window->surface == surface) {
-      window->is_focused = true;
-      state->focused = window;
-      window->pointer_x = wl_fixed_to_double(sx);
-      window->pointer_y = wl_fixed_to_double(sy);
-    } else {
+    if (window->surface != surface) {
       window->is_focused = false;
+      continue;
+    }
+
+    window->is_focused = true;
+    state->focused = window;
+    window->pointer_x = wl_fixed_to_double(sx);
+    window->pointer_y = wl_fixed_to_double(sy);
+
+    // A full-screen surface: wherever the pointer is on it is where it is on
+    // the screen, which is what the initial zoom is centered on.
+    if (!window->pointer_entered) {
+      window->pointer_entered = true;
+      window->pointer_enter_x = window->pointer_x;
+      window->pointer_enter_y = window->pointer_y;
     }
   }
+
+  state->enter_serial = serial;
+  state->enter_serial_valid = true;
 
   if (state->cursor_shape_device != NULL) {
     wp_cursor_shape_device_v1_set_shape(
@@ -1109,6 +1275,10 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
 static void pointer_handle_leave(void *data, struct wl_pointer *pointer,
                                  uint32_t serial, struct wl_surface *surface) {
   struct wooz_state *state = data;
+
+  if (state->windows_pending) {
+    state->input_during_capture = true;
+  }
 
   struct wooz_window *window;
   wl_list_for_each(window, &state->windows, link) {
@@ -1123,6 +1293,11 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer,
                                   uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
+
+  // The compositor may be drawing the pointer into the copies now.
+  if (state->windows_pending) {
+    state->input_during_capture = true;
+  }
 
   if (win == NULL) {
     return;
@@ -1164,6 +1339,10 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer,
   struct wooz_state *state = data;
   struct wooz_window *win = state->focused;
 
+  if (state->windows_pending) {
+    state->input_during_capture = true;
+  }
+
   if (button == BTN_LEFT) {
     if (button_state == WL_POINTER_BUTTON_STATE_PRESSED) {
       // Check for double-click
@@ -1182,7 +1361,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer,
     }
   } else if (button == BTN_RIGHT &&
              button_state == WL_POINTER_BUTTON_STATE_RELEASED) {
-    win->state->n_done = 0;
+    win->state->running = false;
   }
 }
 
@@ -1419,7 +1598,7 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
 
   // Check for custom close key
   if (state->config.close_key != 0 && key == state->config.close_key) {
-    state->n_done = 0;
+    state->running = false;
     return;
   }
 
@@ -1427,7 +1606,7 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard,
   case KEY_ESC:
     // Default close behavior (if no custom close key)
     if (state->config.close_key == 0) {
-      state->n_done = 0;
+      state->running = false;
     }
     break;
 
@@ -1591,17 +1770,6 @@ static void handle_global(void *data, struct wl_registry *registry,
              0) {
     state->cursor_shape_manager = wl_registry_bind(
         registry, name, &wp_cursor_shape_manager_v1_interface, 1);
-  } else if (strcmp(interface,
-                    ext_image_copy_capture_manager_v1_interface.name) == 0) {
-    state->image_copy_capture_manager = wl_registry_bind(
-        registry, name, &ext_image_copy_capture_manager_v1_interface, 1);
-  } else if (strcmp(
-                 interface,
-                 ext_output_image_capture_source_manager_v1_interface.name) ==
-             0) {
-    state->output_image_capture_source_manager = wl_registry_bind(
-        registry, name, &ext_output_image_capture_source_manager_v1_interface,
-        1);
   }
 }
 
@@ -1656,102 +1824,12 @@ static bool should_include_output(struct wooz_output *output,
   }
 
   // If output doesn't have a name yet, we can't filter it
-  if (output->name == NULL) {
+  if (output->xdg_output_name == NULL) {
     return false;
   }
 
   // Check if the output name matches the filter
-  return strcmp(output->name, filter) == 0;
-}
-
-static void cursor_session_handle_enter(
-    void *data, struct ext_image_copy_capture_cursor_session_v1 *session) {
-  // A position event follows, nothing to do here.
-}
-
-static void cursor_session_handle_leave(
-    void *data, struct ext_image_copy_capture_cursor_session_v1 *session) {
-  struct wooz_output *output = data;
-
-  output->cursor_known = false;
-}
-
-static void cursor_session_handle_position(
-    void *data, struct ext_image_copy_capture_cursor_session_v1 *session,
-    int32_t x, int32_t y) {
-  struct wooz_output *output = data;
-
-  output->cursor_x = x;
-  output->cursor_y = y;
-  output->cursor_known = true;
-}
-
-static void cursor_session_handle_hotspot(
-    void *data, struct ext_image_copy_capture_cursor_session_v1 *session,
-    int32_t x, int32_t y) {
-  // The hotspot of the cursor image is irrelevant for placing the view.
-}
-
-static const struct ext_image_copy_capture_cursor_session_v1_listener
-    cursor_session_listener = {
-        .enter = cursor_session_handle_enter,
-        .leave = cursor_session_handle_leave,
-        .position = cursor_session_handle_position,
-        .hotspot = cursor_session_handle_hotspot,
-};
-
-// Sets up a cursor probe per output, so that the initial zoom can be centered
-// on the pointer without wl_pointer (which only reports its position to the
-// focused surface, and some compositors only do so once the pointer moves).
-// Best effort: compositors without ext-image-copy-capture keep using the
-// wl_pointer position and, failing that, the screen center.
-static void setup_cursor_probes(struct wooz_state *state) {
-  if (state->config.zoom_at || state->image_copy_capture_manager == NULL ||
-      state->output_image_capture_source_manager == NULL ||
-      state->pointer == NULL) {
-    return;
-  }
-
-  struct wooz_output *output;
-  wl_list_for_each(output, &state->outputs, link) {
-    if (!should_include_output(output, state->config.output_filter)) {
-      continue;
-    }
-
-    output->cursor_source =
-        ext_output_image_capture_source_manager_v1_create_source(
-            state->output_image_capture_source_manager, output->wl_output);
-    if (output->cursor_source == NULL) {
-      continue;
-    }
-
-    output->cursor_session =
-        ext_image_copy_capture_manager_v1_create_pointer_cursor_session(
-            state->image_copy_capture_manager, output->cursor_source,
-            state->pointer);
-    if (output->cursor_session == NULL) {
-      continue;
-    }
-
-    ext_image_copy_capture_cursor_session_v1_add_listener(
-        output->cursor_session, &cursor_session_listener, output);
-  }
-
-  // Receive the initial cursor positions before the windows are created.
-  wl_display_roundtrip(state->display);
-
-  // Only the startup position is needed, so drop the probes again: capture
-  // sessions shouldn't stay open for the lifetime of the magnifier.
-  wl_list_for_each(output, &state->outputs, link) {
-    if (output->cursor_session != NULL) {
-      ext_image_copy_capture_cursor_session_v1_destroy(output->cursor_session);
-      output->cursor_session = NULL;
-    }
-    if (output->cursor_source != NULL) {
-      ext_image_capture_source_v1_destroy(output->cursor_source);
-      output->cursor_source = NULL;
-    }
-  }
+  return strcmp(output->xdg_output_name, filter) == 0;
 }
 
 static uint32_t parse_key_name(const char *name) {
@@ -1919,43 +1997,8 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  setup_cursor_probes(&state);
-
-  size_t n_pending = 0;
+  size_t n_windows = 0;
   struct wooz_output *output;
-  wl_list_for_each(output, &state.outputs, link) {
-    // Skip outputs that don't match the filter
-    if (!should_include_output(output, state.config.output_filter)) {
-      continue;
-    }
-
-    output->screencopy_frame = zwlr_screencopy_manager_v1_capture_output(
-        state.screencopy_manager, false, output->wl_output);
-    zwlr_screencopy_frame_v1_add_listener(output->screencopy_frame,
-                                          &screencopy_frame_listener, output);
-
-    ++n_pending;
-  }
-
-  if (n_pending == 0) {
-    if (state.config.output_filter != NULL) {
-      fprintf(stderr, "no output found matching '%s'\n",
-              state.config.output_filter);
-    } else {
-      fprintf(stderr, "no outputs found\n");
-    }
-    return EXIT_FAILURE;
-  }
-
-  bool done = false;
-  while (!done && wl_display_dispatch(state.display) != -1) {
-    done = (state.n_done == n_pending);
-  }
-  if (!done) {
-    fprintf(stderr, "failed to screenshoot all outputs\n");
-    return EXIT_FAILURE;
-  }
-
   wl_list_for_each(output, &state.outputs, link) {
     // Skip outputs that don't match the filter
     if (!should_include_output(output, state.config.output_filter)) {
@@ -1982,7 +2025,7 @@ int main(int argc, char *argv[]) {
     // Store initial view for restore/unzoom
     win->initial_view_source = win->view_source;
 
-    if (win->surface == NULL) {
+    if (win->surface == NULL || win->viewport == NULL) {
       fprintf(stderr, "failed to create wayland surface\n");
       return EXIT_FAILURE;
     }
@@ -2005,16 +2048,72 @@ int main(int argc, char *argv[]) {
     zwlr_layer_surface_v1_set_keyboard_interactivity(
         win->layer_surface,
         ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+
+    // The surface is mapped with the transparent placeholder as soon as it has
+    // been configured: the compositor then gives it pointer focus, which is
+    // what makes it possible to hide the pointer and to center the initial zoom
+    // on its position.
+    //
+    // The first commit carries no buffer, as the layer shell protocol requires
+    // before the first configure.
     wl_surface_commit(win->surface);
+
+    ++n_windows;
   }
 
-  state.n_done = 1;
+  if (n_windows == 0) {
+    if (state.config.output_filter != NULL) {
+      fprintf(stderr, "no output found matching '%s'\n",
+              state.config.output_filter);
+    } else {
+      fprintf(stderr, "no outputs found\n");
+    }
+    return EXIT_FAILURE;
+  }
+
+  state.windows_pending = true;
+
+  // Wait for the surfaces to be mapped: the configure event brings them up with
+  // the placeholder, which is what gets them pointer focus, and the enter event
+  // then brings the serial needed to hide the pointer. The pointer is only on
+  // one of the screens at most, so one window is enough.
+  struct wooz_window *win;
+  for (size_t round = 0; round < 16; ++round) {
+    if (wl_display_roundtrip(state.display) < 0) {
+      fprintf(stderr, "wl_display_roundtrip() failed\n");
+      return EXIT_FAILURE;
+    }
+
+    bool all_configured = true;
+    bool any_entered = false;
+    wl_list_for_each(win, &state.windows, link) {
+      all_configured = all_configured && win->configured;
+      any_entered = any_entered || win->pointer_entered;
+    }
+
+    if (all_configured && any_entered) {
+      break;
+    }
+  }
+
+  // Copy the screens without the pointer in them, and show them once they are
+  // all in. The copies are taken in one frame, so the pointer image is hidden
+  // from before they are requested until the last of them has been copied.
+  capture_hide_cursor(&state);
+  wl_list_for_each(win, &state.windows, link) { capture_start(win); }
+
+  if (state.n_capture == 0) {
+    fprintf(stderr, "failed to copy the screen\n");
+    return EXIT_FAILURE;
+  }
+
+  state.running = true;
 
   // Main event loop with timer support
   int wl_fd = wl_display_get_fd(state.display);
   struct pollfd fds[2];
 
-  while (state.n_done) {
+  while (state.running) {
     // Prepare events before dispatching
     while (wl_display_prepare_read(state.display) != 0) {
       wl_display_dispatch_pending(state.display);
@@ -2058,7 +2157,6 @@ int main(int argc, char *argv[]) {
     close(state.repeat_timer_fd);
   }
 
-  struct wooz_window *win;
   struct wooz_window *window_tmp;
   wl_list_for_each_safe(win, window_tmp, &state.windows, link) {
     output = win->output;
@@ -2076,17 +2174,17 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < WOOZ_SCALED_BUFFER_COUNT; ++i) {
       destroy_buffer(win->scaled_buffers[i]);
     }
+    if (win->screencopy_frame != NULL) {
+      zwlr_screencopy_frame_v1_destroy(win->screencopy_frame);
+    }
     free(win->column_map);
     free(win->runs);
     free(win);
 
     // Free output.
     wl_list_remove(&output->link);
-    if (output->name != NULL)
-      free(output->name);
-    if (output->screencopy_frame != NULL) {
-      zwlr_screencopy_frame_v1_destroy(output->screencopy_frame);
-    }
+    if (output->xdg_output_name != NULL)
+      free(output->xdg_output_name);
     destroy_buffer(output->buffer);
     if (output->xdg_output != NULL) {
       zxdg_output_v1_destroy(output->xdg_output);
@@ -2094,14 +2192,10 @@ int main(int argc, char *argv[]) {
     wl_output_release(output->wl_output);
     free(output);
   }
+  if (state.placeholder_buffer != NULL) {
+    wl_buffer_destroy(state.placeholder_buffer);
+  }
   zwlr_screencopy_manager_v1_destroy(state.screencopy_manager);
-  if (state.image_copy_capture_manager != NULL) {
-    ext_image_copy_capture_manager_v1_destroy(state.image_copy_capture_manager);
-  }
-  if (state.output_image_capture_source_manager != NULL) {
-    ext_output_image_capture_source_manager_v1_destroy(
-        state.output_image_capture_source_manager);
-  }
   if (state.xdg_output_manager != NULL) {
     zxdg_output_manager_v1_destroy(state.xdg_output_manager);
   }

@@ -34,10 +34,6 @@ struct wooz_state {
   struct wl_shm *shm;
   struct zxdg_output_manager_v1 *xdg_output_manager;
   struct zwlr_screencopy_manager_v1 *screencopy_manager;
-  // Optional protocols (ext-image-copy-capture) used to locate the pointer.
-  struct ext_image_copy_capture_manager_v1 *image_copy_capture_manager;
-  struct ext_output_image_capture_source_manager_v1
-      *output_image_capture_source_manager;
   struct wp_viewporter *viewporter;
   struct wl_seat *seat;
   struct wl_pointer *pointer;
@@ -48,6 +44,8 @@ struct wooz_state {
   uint32_t axis_source;
   // Depressed keyboard modifiers (enum wl_keyboard_modifier).
   uint32_t modifiers;
+  // Optional protocol (cursor-shape-v1) used to hide the pointer while the
+  // screen is copied and to restore it afterwards.
   struct wp_cursor_shape_manager_v1 *cursor_shape_manager;
   struct wp_cursor_shape_device_v1 *cursor_shape_device;
   struct wl_keyboard *keyboard;
@@ -63,7 +61,22 @@ struct wooz_state {
   uint32_t pressed_key;
   int repeat_timer_fd;
 
-  size_t n_done;
+  // Latest wl_pointer.enter serial: required to set the cursor image.
+  bool enter_serial_valid;
+  uint32_t enter_serial;
+
+  // The windows are mapped with a transparent placeholder while the first
+  // frames are being copied: the compositor only gives pointer focus, and with
+  // it the serial needed to hide the pointer, once the surface has a buffer.
+  bool windows_pending;
+  struct wl_buffer *placeholder_buffer;
+  // Copies requested, and how many of them have completed.
+  size_t n_capture, n_done;
+  bool running;
+  bool capture_cursor_hidden;
+  // The pointer moved since the copies were requested, so they may show it: it
+  // then stays hidden instead of being restored (see capture_restore_cursor()).
+  bool input_during_capture;
 };
 
 struct wooz_buffer;
@@ -81,20 +94,10 @@ struct wooz_output {
   double ratio;
 
   struct wooz_box logical_geometry;
-  double logical_scale; // guessed from the logical size
-  char *name;
+  double logical_scale;  // guessed from the logical size
+  char *xdg_output_name; // from zxdg_output_v1.name, matched by --output
 
   struct wooz_buffer *buffer;
-  struct zwlr_screencopy_frame_v1 *screencopy_frame;
-  uint32_t screencopy_frame_flags; // enum zwlr_screencopy_frame_v1_flags
-
-  // Cursor probe, used to read the pointer position on this output without
-  // relying on pointer focus. Only set up when the compositor supports
-  // ext-image-copy-capture.
-  struct ext_image_capture_source_v1 *cursor_source;
-  struct ext_image_copy_capture_cursor_session_v1 *cursor_session;
-  bool cursor_known;
-  int32_t cursor_x, cursor_y; // hotspot, in output buffer (physical) pixels
 };
 
 // Animated zoom state: the view glides from `from` to `target` over
@@ -121,6 +124,7 @@ struct wooz_window {
   struct zwlr_layer_surface_v1 *layer_surface;
   struct wp_viewport *viewport;
   struct wl_surface *surface;
+  struct zwlr_screencopy_frame_v1 *screencopy_frame;
 
   // Viewport source rectangle.
   struct wooz_boxf view_source;
@@ -148,7 +152,18 @@ struct wooz_window {
 
   bool is_focused;
   bool configured; // A layer surface configure has been received
+  // The surface shows the placeholder buffer instead of a copied frame.
+  bool placeholder;
+  // The frame has been copied and can be shown, see capture_start().
+  bool frame_ready;
   bool initial_zoom_applied;
+
+  // Where `wl_pointer.enter` reported the pointer while the placeholder was
+  // mapped: on the screens the pointer is on, those coordinates are its
+  // position.
+  bool pointer_entered;
+  double pointer_enter_x, pointer_enter_y;
+
   // Client-side nearest-neighbor rendering of the magnified region, used when
   // anti-aliasing is disabled.
   struct wooz_buffer *scaled_buffers[WOOZ_SCALED_BUFFER_COUNT];

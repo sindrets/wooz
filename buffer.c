@@ -91,6 +91,9 @@ void destroy_buffer(struct wooz_buffer *buffer) {
     return;
   }
   munmap(buffer->data, buffer->size);
-  wl_buffer_destroy(buffer->wl_buffer);
+  // Buffers kept behind a NULL wl_buffer outlive the struct.
+  if (buffer->wl_buffer != NULL) {
+    wl_buffer_destroy(buffer->wl_buffer);
+  }
   free(buffer);
 }

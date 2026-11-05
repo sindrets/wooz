@@ -2,7 +2,7 @@
 
 https://github.com/user-attachments/assets/23e9aeac-4f60-47e6-9c49-7a3706bcdbe9
 
-A powerful and customizable screen magnifier for wlroots-based Wayland compositors (requires the wlr-layer-shell, wlr-screencopy-unstable-v1, viewporter and xdg-output protocols) with mouse and keyboard controls.
+A powerful and customizable screen magnifier for wlroots-based Wayland compositors (requires the wlr-layer-shell, wlr-screencopy-unstable-v1, cursor-shape-v1, viewporter and xdg-output protocols) with mouse and keyboard controls.
 
 ## Usage
 
@@ -69,7 +69,6 @@ wooz --zoom-in 25% --mouse-track --map-close x
 # Invert scroll direction (scroll up to zoom in)
 wooz --invert-scroll
 ```
-
 
 ## Building from source
 
