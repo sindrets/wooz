@@ -19,7 +19,7 @@ wooz [options...]
 * `--zoom-in PERCENT` - Set initial zoom percentage (e.g., '10%', '50%')
 * `--zoom-at X,Y` - Center the initial zoom on the given position instead of the
   cursor (output logical coordinates, i.e. relative to each output's top-left)
-* `--invert-scroll` - Invert scroll direction (scroll up zooms in)
+* `--invert-scroll` - Invert scroll direction (scroll up zooms out)
 * `--no-aa` - Start with anti-aliasing disabled (nearest-neighbor scaling)
 
 ### Controls
@@ -66,7 +66,7 @@ wooz --output DP-1
 # Combine options
 wooz --zoom-in 25% --mouse-track --map-close x
 
-# Invert scroll direction (scroll up to zoom in)
+# Invert scroll direction (scroll up zooms out)
 wooz --invert-scroll
 ```
 

@@ -1395,13 +1395,12 @@ static void scroll_zoom(struct wooz_state *state, struct wooz_window *win,
   struct wooz_boxf *reference = zoom_reference(win);
   double scale = reference->width / win->output->geometry.width;
   // x10 for faster zoom.
-  double scroll = wl_fixed_to_double(value) * 2 * scale * 10;
+  double scroll = -wl_fixed_to_double(value) * 2 * scale * 10;
 
   // Invert scroll if configured
   if (state->config.invert_scroll) {
     scroll = -scroll;
   }
-
   zoom_by(win, scroll, win->pointer_x, win->pointer_y);
 }
 
@@ -1796,7 +1795,7 @@ static const char usage[] =
     "'50%')\n"
     "  --zoom-at X,Y           Zoom at a position instead of the cursor "
     "(output\n"
-    "  --invert-scroll         Invert scroll direction (scroll up zooms in)\n"
+    "  --invert-scroll         Invert scroll direction (scroll up zooms out)\n"
     "  --no-aa                 Start with anti-aliasing disabled "
     "(nearest-neighbor)\n"
     "                          logical coordinates)\n"

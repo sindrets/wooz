@@ -19,7 +19,7 @@ struct wooz_config {
   bool mouse_track; // Enable mouse tracking
   double initial_zoom; // Initial zoom percentage (0.0 = no zoom, 0.1 = 10%)
   char *output_filter; // Filter to specific output name (NULL = all outputs)
-  bool invert_scroll;  // Invert scroll direction (scroll up zooms in)
+  bool invert_scroll;  // Invert scroll direction (scroll up zooms out)
   bool antialias;      // Enable anti-aliasing of the magnified region
   // Initial zoom position in output logical coordinates, instead of the cursor.
   bool zoom_at;
