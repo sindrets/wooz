@@ -15,7 +15,8 @@ wooz [options...]
 * `-h, --help` - Show help message and quit
 * `--map-close KEY` - Set key to close (e.g., 'Esc', 'q', 'x')
 * `--mouse-track` - Enable mouse tracking (follow mouse without clicking)
-* `--output NAME` - Run on specific output (e.g., 'DP-1', 'HDMI-A-1')
+* `--output NAME` - Run on a specific output (e.g., 'DP-1', 'HDMI-A-1') instead
+  of the current one
 * `--zoom-in PERCENT` - Set initial zoom percentage (e.g., '10%', '50%')
 * `--zoom-at X,Y` - Center the initial zoom on the given position instead of the
   cursor (output logical coordinates, i.e. relative to each output's top-left)
@@ -60,7 +61,8 @@ wooz --mouse-track
 # Use 'q' key to exit instead of Esc
 wooz --map-close q
 
-# Run on a specific output only
+# Run on a specific output only (the default is the current output, i.e. the one
+# the pointer is on)
 wooz --output DP-1
 
 # Combine options

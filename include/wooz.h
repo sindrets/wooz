@@ -18,7 +18,8 @@ struct wooz_config {
       close_key;    // Linux input event code for close action (0 = default Esc)
   bool mouse_track; // Enable mouse tracking
   double initial_zoom; // Initial zoom percentage (0.0 = no zoom, 0.1 = 10%)
-  char *output_filter; // Filter to specific output name (NULL = all outputs)
+  char *output_filter; // Filter to specific output name (NULL = current output)
+  bool output_is_name;
   bool invert_scroll;  // Invert scroll direction (scroll up zooms out)
   bool antialias;      // Enable anti-aliasing of the magnified region
   // Initial zoom position in output logical coordinates, instead of the cursor.
@@ -70,6 +71,12 @@ struct wooz_state {
   // it the serial needed to hide the pointer, once the surface has a buffer.
   bool windows_pending;
   struct wl_buffer *placeholder_buffer;
+  // Set when the pointer is found on one of the probe surfaces while wooz is
+  // looking for the current output.
+  struct wooz_window *probe_pick;
+  bool probe_resolved;
+  // The probes could not tell, so the windows show on every output after all.
+  bool show_all_outputs;
   // Copies requested, and how many of them have completed.
   size_t n_capture, n_done;
   bool running;
@@ -150,12 +157,16 @@ struct wooz_window {
   uint32_t last_click_time;
   uint32_t last_click_button;
 
-  bool is_focused;
+  // The pointer is on this window: it has pointer focus, and it was the
+  // current output when wooz started.
+  bool pointer_is_over;
   bool configured; // A layer surface configure has been received
   // The surface shows the placeholder buffer instead of a copied frame.
   bool placeholder;
   // The frame has been copied and can be shown, see capture_start().
   bool frame_ready;
+  // true while running output / cursor probes
+  bool probing;
   bool initial_zoom_applied;
 
   // Where `wl_pointer.enter` reported the pointer while the placeholder was

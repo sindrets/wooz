@@ -1118,6 +1118,13 @@ static void layer_surface_handle_configure(
   if (width != 0 && height != 0 && win->viewport != NULL) {
     wp_viewport_set_destination(win->viewport, width, height);
   }
+  // Wooz starts on the current output only, and the probe that found it moves
+  // the screen there; the others are dropped instead of waiting for a size
+  // they are never shown at.
+  if (win->probing && win->state->probe_resolved &&
+      win->state->probe_pick != win) {
+    return;
+  }
 
   win->configured = true;
 
@@ -1138,10 +1145,21 @@ static void layer_surface_handle_configure(
   }
 }
 
+// The compositor can take a layer surface down (an exclusive keyboard grab
+// being taken away, say). Wooz is one screen with a magnified view on it, so
+// that ends the session - unless the surface was one of the startup probes,
+// which are taken down on purpose once the current output is known.
 static void
 layer_surface_handle_closed(void *data,
                             struct zwlr_layer_surface_v1 *layer_surface) {
   struct wooz_window *win = data;
+
+  win->layer_surface = NULL;
+  if (win->probing) {
+    win->probing = false;
+    return;
+  }
+
   win->state->running = false;
 }
 
@@ -1236,6 +1254,15 @@ static void capture_window_done(struct wooz_window *win, bool failed) {
   capture_restore_cursor(state);
 }
 
+// Records the window the pointer was found on while wooz is looking for the
+// current output (see the probe in main()): that is the output wooz displays
+// on. The other candidates are torn down from there once the dispatch is over.
+static void probe_pick_output(struct wooz_state *state,
+                              struct wooz_window *win) {
+  state->probe_pick = win;
+  state->probe_resolved = true;
+}
+
 static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
                                  uint32_t serial, struct wl_surface *surface,
                                  wl_fixed_t sx, wl_fixed_t sy) {
@@ -1244,11 +1271,11 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
   struct wooz_window *window;
   wl_list_for_each(window, &state->windows, link) {
     if (window->surface != surface) {
-      window->is_focused = false;
+      window->pointer_is_over = false;
       continue;
     }
 
-    window->is_focused = true;
+    window->pointer_is_over = true;
     state->focused = window;
     window->pointer_x = wl_fixed_to_double(sx);
     window->pointer_y = wl_fixed_to_double(sy);
@@ -1259,6 +1286,12 @@ static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
       window->pointer_entered = true;
       window->pointer_enter_x = window->pointer_x;
       window->pointer_enter_y = window->pointer_y;
+    }
+
+    // While wooz is looking for the current output, the surface the pointer
+    // lands on is on that output: the others are dropped.
+    if (window->probing && !state->probe_resolved) {
+      probe_pick_output(state, window);
     }
   }
 
@@ -1283,8 +1316,7 @@ static void pointer_handle_leave(void *data, struct wl_pointer *pointer,
   struct wooz_window *window;
   wl_list_for_each(window, &state->windows, link) {
     if (window->surface == surface) {
-      window->is_focused = false;
-      break;
+      window->pointer_is_over = false;
     }
   }
 }
@@ -1790,15 +1822,17 @@ static const char usage[] =
     "  --map-close KEY         Set key to close (e.g., 'Esc', 'q')\n"
     "  --mouse-track           Enable mouse tracking (follow mouse without "
     "clicking)\n"
-    "  --output NAME           Run on specific output (e.g., 'DP-1')\n"
+    "  --output NAME           Run on a specific output (e.g., 'DP-1') "
+    "instead\n"
+    "                          of the one the pointer is on\n"
     "  --zoom-in PERCENT       Set initial zoom percentage (e.g., '10%', "
     "'50%')\n"
     "  --zoom-at X,Y           Zoom at a position instead of the cursor "
     "(output\n"
+    "                          logical coordinates)\n"
     "  --invert-scroll         Invert scroll direction (scroll up zooms out)\n"
     "  --no-aa                 Start with anti-aliasing disabled "
     "(nearest-neighbor)\n"
-    "                          logical coordinates)\n"
     "\n"
     "Controls:\n"
     "  Mouse scroll            Zoom in/out at mouse position\n"
@@ -1815,22 +1849,6 @@ static const char usage[] =
     "off)\n"
     "  Esc                     Exit (default)\n";
 
-static bool should_include_output(struct wooz_output *output,
-                                  const char *filter) {
-  // If no filter is set, include all outputs
-  if (filter == NULL) {
-    return true;
-  }
-
-  // If output doesn't have a name yet, we can't filter it
-  if (output->xdg_output_name == NULL) {
-    return false;
-  }
-
-  // Check if the output name matches the filter
-  return strcmp(output->xdg_output_name, filter) == 0;
-}
-
 static uint32_t parse_key_name(const char *name) {
   if (strcmp(name, "Esc") == 0 || strcmp(name, "Escape") == 0) {
     return KEY_ESC;
@@ -1840,6 +1858,43 @@ static uint32_t parse_key_name(const char *name) {
     return KEY_X;
   }
   return 0; // Invalid key
+}
+
+// Whether a window on this output is the one wooz shows on: --output names it
+// explicitly, and without one it is the current output, i.e. the one the
+// pointer is on (see the probe in main()).
+static bool should_include_output(struct wooz_output *output,
+                                  const struct wooz_config *config) {
+  if (!config->output_is_name) {
+    return true;
+  }
+  if (output->xdg_output_name == NULL) {
+    return false;
+  }
+  return strcmp(output->xdg_output_name, config->output_filter) == 0;
+}
+
+// Releases a window's Wayland objects. The output it was on outlives it: more
+// than one window can be on the same output while the probes are up, and the
+// outputs are released with the state.
+static void destroy_window(struct wooz_window *win) {
+  if (win->layer_surface != NULL)
+    zwlr_layer_surface_v1_destroy(win->layer_surface);
+  if (win->viewport != NULL)
+    wp_viewport_destroy(win->viewport);
+  if (win->zoom.frame_callback != NULL)
+    wl_callback_destroy(win->zoom.frame_callback);
+  if (win->surface != NULL)
+    wl_surface_destroy(win->surface);
+  for (int i = 0; i < WOOZ_SCALED_BUFFER_COUNT; ++i) {
+    destroy_buffer(win->scaled_buffers[i]);
+  }
+  if (win->screencopy_frame != NULL) {
+    zwlr_screencopy_frame_v1_destroy(win->screencopy_frame);
+  }
+  free(win->column_map);
+  free(win->runs);
+  free(win);
 }
 
 int main(int argc, char *argv[]) {
@@ -1880,6 +1935,9 @@ int main(int argc, char *argv[]) {
       break;
     case 'o':
       config.output_filter = strdup(optarg);
+      // "current" asks for the output the pointer is on, which is what leaving
+      // --output out does.
+      config.output_is_name = strcmp(optarg, "current") != 0;
       break;
     case 'z': {
       char *endptr;
@@ -1996,11 +2054,14 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  size_t n_windows = 0;
+  bool pick_current = !state.config.output_is_name;
+  size_t n_candidates = 0;
   struct wooz_output *output;
   wl_list_for_each(output, &state.outputs, link) {
-    // Skip outputs that don't match the filter
-    if (!should_include_output(output, state.config.output_filter)) {
+    // Output names are known by now (see the zxdg_output_v1 round trip above),
+    // so an output asked for by name gets its window and the others are left
+    // alone: no surface is put up on a screen wooz isn't displayed on.
+    if (!pick_current && !should_include_output(output, &state.config)) {
       continue;
     }
 
@@ -2044,9 +2105,14 @@ int main(int argc, char *argv[]) {
     // No exclusive zone: cover the entire output, including areas
     // occupied by other layers (e.g. panels)
     zwlr_layer_surface_v1_set_exclusive_zone(win->layer_surface, -1);
+    // Only the screen wooz is displayed on takes the keyboard: the probes only
+    // exist to find it, and a probe whose exclusive keyboard focus has to be
+    // taken away again is not handed back to the surface that stays (see
+    // probe_pick_output()).
     zwlr_layer_surface_v1_set_keyboard_interactivity(
         win->layer_surface,
-        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+        pick_current ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE
+                     : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
 
     // The surface is mapped with the transparent placeholder as soon as it has
     // been configured: the compositor then gives it pointer focus, which is
@@ -2057,11 +2123,14 @@ int main(int argc, char *argv[]) {
     // before the first configure.
     wl_surface_commit(win->surface);
 
-    ++n_windows;
+    // The current output is not known yet: every output is a candidate until
+    // the pointer has been found on one of them.
+    win->probing = pick_current;
+    ++n_candidates;
   }
 
-  if (n_windows == 0) {
-    if (state.config.output_filter != NULL) {
+  if (n_candidates == 0) {
+    if (state.config.output_is_name) {
       fprintf(stderr, "no output found matching '%s'\n",
               state.config.output_filter);
     } else {
@@ -2074,8 +2143,12 @@ int main(int argc, char *argv[]) {
 
   // Wait for the surfaces to be mapped: the configure event brings them up with
   // the placeholder, which is what gets them pointer focus, and the enter event
-  // then brings the serial needed to hide the pointer. The pointer is only on
-  // one of the screens at most, so one window is enough.
+  // then brings the serial needed to hide the pointer.
+	//
+	// With no output given, the enter event also tells us which output to use as
+	// the current. A pointer that is on none of our surfaces (it can be on
+	// another client's window) leaves it unknown, and the screens then show on
+	// every output.
   struct wooz_window *win;
   for (size_t round = 0; round < 16; ++round) {
     if (wl_display_roundtrip(state.display) < 0) {
@@ -2083,15 +2156,54 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
 
+    // Keep the candidates still in the race; the others are done with.
+    struct wooz_window *win_tmp;
+    wl_list_for_each_safe(win, win_tmp, &state.windows, link) {
+      if (win->configured && win->probing && state.probe_resolved &&
+          win != state.probe_pick) {
+        wl_list_remove(&win->link);
+        destroy_window(win);
+      }
+    }
+
     bool all_configured = true;
     bool any_entered = false;
+    bool any_probing = false;
     wl_list_for_each(win, &state.windows, link) {
       all_configured = all_configured && win->configured;
       any_entered = any_entered || win->pointer_entered;
+      any_probing = any_probing || win->probing;
     }
 
     if (all_configured && any_entered) {
       break;
+    }
+
+    // Every surface has been up for a full round trip and the pointer is on
+    // none of them: nothing more is coming.
+    if (all_configured && !any_probing) {
+      break;
+    }
+  }
+
+  // Now that it is known which screen is displayed on, it takes the keyboard -
+  // the probes were mapped without it, so that none of them has to be given
+  // focus and then taken down.
+  if (pick_current) {
+    if (!state.probe_resolved) {
+      // The pointer is on none of the screens (it can be on another client's
+      // window): wooz has no current output to go by, so it shows on every
+      // output.
+      state.show_all_outputs = true;
+    }
+    wl_list_for_each(win, &state.windows, link) {
+      win->probing = false;
+      if (state.show_all_outputs || win == state.probe_pick) {
+        zwlr_layer_surface_v1_set_keyboard_interactivity(
+            win->layer_surface,
+            ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+        wl_surface_commit(win->surface);
+      }
     }
   }
 
@@ -2158,29 +2270,13 @@ int main(int argc, char *argv[]) {
 
   struct wooz_window *window_tmp;
   wl_list_for_each_safe(win, window_tmp, &state.windows, link) {
-    output = win->output;
-
-    // Free window.
     wl_list_remove(&win->link);
-    if (win->layer_surface != NULL)
-      zwlr_layer_surface_v1_destroy(win->layer_surface);
-    if (win->viewport != NULL)
-      wp_viewport_destroy(win->viewport);
-    if (win->zoom.frame_callback != NULL)
-      wl_callback_destroy(win->zoom.frame_callback);
-    if (win->surface != NULL)
-      wl_surface_destroy(win->surface);
-    for (int i = 0; i < WOOZ_SCALED_BUFFER_COUNT; ++i) {
-      destroy_buffer(win->scaled_buffers[i]);
-    }
-    if (win->screencopy_frame != NULL) {
-      zwlr_screencopy_frame_v1_destroy(win->screencopy_frame);
-    }
-    free(win->column_map);
-    free(win->runs);
-    free(win);
+    destroy_window(win);
+  }
 
-    // Free output.
+  // Every output wooz found, including the ones it ended up not displaying on.
+  struct wooz_output *output_tmp;
+  wl_list_for_each_safe(output, output_tmp, &state.outputs, link) {
     wl_list_remove(&output->link);
     if (output->xdg_output_name != NULL)
       free(output->xdg_output_name);
